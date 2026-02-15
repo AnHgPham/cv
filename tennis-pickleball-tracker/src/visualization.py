@@ -525,11 +525,11 @@ class HeatmapGenerator:
         if save_path:
             fig.savefig(save_path, dpi=100, bbox_inches="tight")
 
-        # Convert figure to image array
+        # Convert figure to image array (compatible with all matplotlib versions)
         fig.canvas.draw()
-        img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-        img = img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        img_rgba = np.asarray(fig.canvas.buffer_rgba())
+        img_rgb = img_rgba[:, :, :3]  # drop alpha channel
+        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
 
         plt.close(fig)
         return img_bgr
