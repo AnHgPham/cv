@@ -1,0 +1,36 @@
+# Tennis/Pickleball Detection & Tracking - Dependencies
+# Python 3.8+
+
+# Core
+numpy>=1.24.0
+scipy>=1.10.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+ultralytics>=8.0.0
+
+# Tracking
+filterpy>=1.4.5
+deep-sort-realtime>=1.3.2
+
+# Machine Learning
+scikit-learn>=1.3.0
+catboost>=1.2.0
+
+# Data Augmentation
+albumentations>=1.3.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Experiment Tracking
+wandb>=0.15.0
+
+# Utilities
+tqdm>=4.65.0
+PyYAML>=6.0
+pandas>=2.0.0

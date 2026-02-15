@@ -1,0 +1,54 @@
+# YOLOv8 Configuration for Tennis/Pickleball Detection
+# =====================================================
+
+# Model
+model: yolov8s.pt  # yolov8n.pt (nano/fast) or yolov8s.pt (small/accurate)
+
+# Training
+train:
+  epochs: 100
+  batch_size: 16
+  imgsz: 640
+  lr0: 0.01
+  lrf: 0.01
+  momentum: 0.937
+  weight_decay: 0.0005
+  warmup_epochs: 3
+  patience: 20  # early stopping
+  workers: 8
+
+# Data
+data:
+  train: data/frames/train
+  val: data/frames/val
+  test: data/frames/test
+  names:
+    0: ball
+    1: player
+  nc: 2  # number of classes
+
+# Augmentation (via Ultralytics built-in)
+augmentation:
+  hsv_h: 0.015
+  hsv_s: 0.7
+  hsv_v: 0.4
+  degrees: 0.0
+  translate: 0.1
+  scale: 0.5
+  shear: 0.0
+  flipud: 0.0
+  fliplr: 0.5
+  mosaic: 1.0
+  mixup: 0.0
+
+# Inference
+inference:
+  conf_threshold: 0.25
+  iou_threshold: 0.45
+  max_det: 10
+  imgsz: 640
+  device: "0"  # CUDA device, or "cpu"
+
+# Paths
+output_dir: outputs/yolo
+weights_dir: models/ball_detector

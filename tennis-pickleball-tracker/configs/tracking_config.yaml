@@ -1,0 +1,43 @@
+# Tracking Configuration
+# ======================
+
+# Kalman Filter - Ball Tracking
+kalman_filter:
+  # State: [x, y, vx, vy]
+  dim_x: 4
+  dim_z: 2
+  # Process noise
+  process_noise_std: 5.0
+  # Measurement noise
+  measurement_noise_std: 2.0
+  # Initial covariance
+  initial_covariance: 100.0
+  # Max frames without detection before killing track
+  max_missing_frames: 10
+  # Max prediction-only steps
+  max_prediction_steps: 5
+
+# Optical Flow - Lucas-Kanade
+optical_flow:
+  win_size: [21, 21]
+  max_level: 3
+  criteria_max_count: 30
+  criteria_epsilon: 0.01
+  # Min eigenvalue threshold
+  min_eig_threshold: 0.001
+
+# DeepSORT - Player Tracking
+deepsort:
+  max_age: 30               # Max frames to keep track without detection
+  n_init: 3                 # Min detections before track is confirmed
+  max_iou_distance: 0.7     # Max IoU distance for matching
+  max_cosine_distance: 0.3  # Max cosine distance for appearance matching
+  nn_budget: 100             # Max gallery size for appearance features
+  embedder: "mobilenet"      # Appearance feature extractor
+
+# General Tracking
+general:
+  min_detection_confidence: 0.3
+  nms_threshold: 0.4
+  # Association
+  iou_threshold: 0.3

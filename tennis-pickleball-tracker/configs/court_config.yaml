@@ -1,0 +1,70 @@
+# Court Detection Configuration
+# ==============================
+
+# Court Dimensions (meters) - Standard Tennis Court
+tennis_court:
+  length: 23.77
+  width: 10.97
+  singles_width: 8.23
+  service_line_distance: 6.40
+  net_distance: 11.885  # half of length
+  # 14 keypoints (x, y) in court coordinates
+  keypoints:
+    - [0.0, 0.0]           # Top-left corner
+    - [0.0, 5.485]         # Top-left singles
+    - [0.0, 10.97]         # Top-right corner
+    - [6.40, 0.0]          # Left service line top
+    - [6.40, 5.485]        # Left service T
+    - [6.40, 10.97]        # Right service line top
+    - [11.885, 0.0]        # Net left
+    - [11.885, 5.485]      # Net center
+    - [11.885, 10.97]      # Net right
+    - [17.385, 0.0]        # Right service line bottom
+    - [17.385, 5.485]      # Right service T
+    - [17.385, 10.97]      # Right service line bottom-right
+    - [23.77, 0.0]         # Bottom-left corner
+    - [23.77, 10.97]       # Bottom-right corner
+
+# Court Dimensions (feet) - Standard Pickleball Court
+pickleball_court:
+  length: 13.41  # 44 feet in meters
+  width: 6.10    # 20 feet in meters
+  non_volley_zone: 2.13  # 7 feet (kitchen)
+  net_distance: 6.705
+
+# Classical Detection Parameters
+classical:
+  # Color thresholding (for white lines)
+  white_lower_hsv: [0, 0, 180]
+  white_upper_hsv: [180, 50, 255]
+  
+  # Morphological operations
+  morph_kernel_size: 5
+  dilate_iterations: 2
+  erode_iterations: 1
+  
+  # Canny edge detection
+  canny_low: 50
+  canny_high: 150
+  
+  # Hough Transform
+  hough_rho: 1
+  hough_theta: 0.01745  # pi/180
+  hough_threshold: 100
+  hough_min_line_length: 50
+  hough_max_line_gap: 30
+  
+  # Line filtering
+  horizontal_angle_thresh: 30  # degrees from horizontal
+  vertical_angle_thresh: 30    # degrees from vertical
+  
+  # RANSAC
+  ransac_reproj_threshold: 5.0
+
+# Deep Learning Court Detection
+deep_learning:
+  model: resnet18           # backbone for keypoint detection
+  num_keypoints: 14
+  input_size: [640, 360]
+  weights: models/court_detector/court_keypoint_best.pt
+  confidence_threshold: 0.5

@@ -1,0 +1,47 @@
+# TrackNet Configuration for Ball Detection
+# ==========================================
+
+# Model Architecture
+model:
+  name: TrackNet
+  input_frames: 3          # Number of consecutive frames as input
+  input_height: 360
+  input_width: 640
+  output_channels: 1       # Heatmap output
+  backbone: vgg16           # Encoder backbone
+
+# Training
+train:
+  epochs: 30
+  batch_size: 8
+  learning_rate: 1.0
+  optimizer: Adadelta
+  loss: focal_loss          # focal_loss or weighted_bce
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  num_workers: 4
+  save_period: 5
+  early_stopping_patience: 10
+
+# Data
+data:
+  train_dir: data/frames/train
+  val_dir: data/frames/val
+  test_dir: data/frames/test
+  label_csv: data/labels/ball_labels.csv
+  # Label format: frame_id, x, y, visibility (0=not visible, 1=visible)
+
+# Heatmap Generation
+heatmap:
+  sigma: 2.5               # Gaussian sigma for heatmap generation
+  threshold: 0.5            # Detection threshold on output heatmap
+
+# Inference
+inference:
+  weights: models/ball_detector/tracknet_best.pt
+  conf_threshold: 0.5
+  device: "0"
+
+# Paths
+output_dir: outputs/tracknet
+weights_dir: models/ball_detector
