@@ -1,0 +1,50 @@
+# Video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.wmv
+*.flv
+
+# Large output files
+outputs/
+*.weights
+*.pt
+*.pth
+*.onnx
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data
+data/raw/*.mp4
+data/raw/*.avi
+data/processed/
+
+# Models
+models/*.pt
+models/*.pth
+models/*.weights
+
+# Temp files
+*.tmp
+*.log

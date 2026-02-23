@@ -534,7 +534,10 @@ class DeepSORTTracker:
             return results
 
         # Compute IoU cost matrix
-        from .object_detection import _compute_iou
+        try:
+            from .object_detection import _compute_iou
+        except ImportError:
+            from object_detection import _compute_iou
 
         cost_matrix = np.zeros(
             (len(self._simple_tracks), len(detections))

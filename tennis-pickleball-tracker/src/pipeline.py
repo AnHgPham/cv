@@ -119,6 +119,9 @@ class PipelineConfig:
         # Court type: "tennis" or "pickleball"
         self.court_type = self.config.get("court_type", "tennis")
 
+        # Max players on court (2 for singles, 4 for doubles)
+        self.max_players = self.config.get("max_players", 4)
+
         # Tracking parameters
         self.process_noise = self.config.get("process_noise", 5.0)
         self.measurement_noise = self.config.get("measurement_noise", 2.0)
@@ -163,15 +166,21 @@ class TennisPickleballPipeline:
         self.ball_detectors = {}
         self.player_detectors = {}
 
+        # Determine if YOLO model is custom-trained or COCO pretrained
+        _is_custom = cfg.config.get("is_custom_yolo", False)
+
         # Ball detection
         if cfg.detection_method in ("yolo", "combined"):
             try:
-                self.ball_detectors["yolo"] = YOLODetector(
+                self._yolo_detector = YOLODetector(
                     model_path=cfg.yolo_model,
                     conf_threshold=cfg.yolo_conf,
                     device=cfg.device,
+                    is_custom_model=_is_custom,
                 )
+                self.ball_detectors["yolo"] = self._yolo_detector
             except Exception as e:
+                self._yolo_detector = None
                 print(f"WARNING: Could not load YOLO: {e}")
 
         if cfg.detection_method in ("tracknet", "combined"):
@@ -183,7 +192,7 @@ class TennisPickleballPipeline:
         if cfg.detection_method in ("classical", "combined"):
             self.ball_detectors["classical"] = ClassicalBallDetector()
 
-        # Player detection
+        # Player detection (shares YOLO model instance but filters differently)
         if cfg.player_method == "yolo" and "yolo" in self.ball_detectors:
             self.player_detectors["yolo"] = self.ball_detectors["yolo"]
         elif cfg.player_method == "fasterrcnn":
@@ -220,6 +229,9 @@ class TennisPickleballPipeline:
 
         # State
         self.homography: Optional[np.ndarray] = None
+        self.homography_inv: Optional[np.ndarray] = None
+        self.court_image_polygon: Optional[np.ndarray] = None
+        self.frame_size: Optional[Tuple[int, int]] = None  # (width, height)
         self.ball_pixel_positions: List[Tuple[float, float]] = []
         self.frame_count = 0
 
@@ -356,6 +368,8 @@ class TennisPickleballPipeline:
         Returns dictionary with all intermediate and final results.
         """
         self.frame_count = frame_idx
+        h, w = frame.shape[:2]
+        self.frame_size = (w, h)
         result = {
             "frame_idx": frame_idx,
             "ball_detected": False,
@@ -378,6 +392,28 @@ class TennisPickleballPipeline:
                 result["court_detected"] = True
                 result["homography"] = H
 
+                # Build court polygon from detected intersections.
+                # Filter out noise (intersections far outside frame),
+                # then extend polygon to frame bottom for near-side players.
+                # Prefer homography-based polygon (projects real court
+                # corners to image space — tight and accurate).
+                # Fall back to intersection-based polygon if H is bad.
+                poly = self._build_court_polygon_from_homography(
+                    H, frame.shape
+                )
+                if poly is None and court_result.get("intersections"):
+                    poly = self._build_court_polygon(
+                        court_result["intersections"], frame.shape
+                    )
+                if poly is not None:
+                    self.court_image_polygon = poly
+
+                # Pass court polygon to classical ball detector
+                if "classical" in self.ball_detectors:
+                    self.ball_detectors["classical"].set_court_polygon(
+                        self.court_image_polygon.astype(np.int32)
+                    )
+
                 # Initialize/update 3D reconstructor
                 if self.trajectory_reconstructor is None:
                     fps = 30.0  # Default; overridden in process_video
@@ -391,10 +427,15 @@ class TennisPickleballPipeline:
         ball_detection = None
         player_detections = []
 
-        # Ball detection
-        for name, detector in self.ball_detectors.items():
+        # Ball detection: try classical first (better for small tennis ball),
+        # then YOLO, then other methods
+        detection_order = ["classical", "yolo", "tracknet"]
+        for name in detection_order:
+            detector = self.ball_detectors.get(name)
+            if detector is None:
+                continue
             dets = detector.detect(frame)
-            ball_dets = [d for d in dets if d.class_name == "ball"]
+            ball_dets = [d for d in dets if d.class_name in ("ball", "sports ball")]
             if ball_dets:
                 # Take highest confidence ball detection
                 ball_detection = max(ball_dets, key=lambda d: d.confidence)
@@ -407,6 +448,9 @@ class TennisPickleballPipeline:
             if player_detections:
                 player_detections = non_max_suppression(player_detections)
                 break
+
+        # ---- Filter players to court area only ----
+        player_detections = self._filter_players_on_court(player_detections)
 
         if ball_detection:
             result["ball_detected"] = True
@@ -440,6 +484,186 @@ class TennisPickleballPipeline:
             result["ball_court_position"] = (court_pos[0], court_pos[1])
 
         return result
+
+    @staticmethod
+    def _build_court_polygon_from_homography(
+        H: np.ndarray,
+        frame_shape: Tuple,
+        padding_m: float = 2.0,
+    ) -> Optional[np.ndarray]:
+        """
+        Build court polygon by projecting standard court corners through
+        the inverse homography (court coords -> image coords).
+
+        This is much more accurate than using raw intersections, since it
+        only outlines the *main* court and ignores adjacent courts.
+
+        Args:
+            H: 3x3 homography mapping image -> court coordinates
+            frame_shape: (height, width, ...)
+            padding_m: meters of padding around the court (for players
+                        standing just outside the lines)
+        """
+        try:
+            H_inv = np.linalg.inv(H)
+        except np.linalg.LinAlgError:
+            return None
+
+        h, w = frame_shape[:2]
+
+        # Tennis court dimensions: 23.77m x 10.97m (doubles width)
+        court_pts = np.array([
+            [-padding_m,              -padding_m],               # top-left
+            [-padding_m,              10.97 + padding_m],        # top-right
+            [23.77 + padding_m,       10.97 + padding_m],        # bottom-right
+            [23.77 + padding_m,       -padding_m],               # bottom-left
+        ], dtype=np.float32)
+
+        # Project court corners to image space using cv2.perspectiveTransform
+        court_pts_2d = court_pts.reshape(-1, 1, 2)
+        img_pts = cv2.perspectiveTransform(court_pts_2d, H_inv)
+        img_pts = img_pts.reshape(-1, 2).astype(np.float32)
+
+        # Check for NaN / inf
+        if np.any(~np.isfinite(img_pts)):
+            return None
+
+        # Sanity check: projected points should be somewhat near the frame
+        margin = max(w, h)
+        if (np.any(img_pts < -margin) or np.any(img_pts[:, 0] > w + margin)
+                or np.any(img_pts[:, 1] > h + margin)):
+            return None
+
+        # Extend polygon to frame bottom for near-side players
+        x_min = float(img_pts[:, 0].min())
+        x_max = float(img_pts[:, 0].max())
+        bottom_pts = np.array([
+            [max(0.0, x_min), float(h)],
+            [min(float(w), x_max), float(h)],
+        ], dtype=np.float32)
+
+        all_pts = np.vstack([img_pts, bottom_pts]).astype(np.float32)
+        hull = cv2.convexHull(all_pts)
+        return hull.reshape(-1, 2).astype(np.float32)
+
+    @staticmethod
+    def _build_court_polygon(
+        intersections: List[Tuple[float, float]],
+        frame_shape: Tuple,
+    ) -> Optional[np.ndarray]:
+        """
+        Build a court polygon from detected line intersections.
+
+        Steps:
+        1. Filter intersections to only those within/near the frame
+        2. Build convex hull
+        3. Extend polygon to frame bottom (near-side baseline is
+           often at the very bottom of the camera view)
+        """
+        h, w = frame_shape[:2]
+        margin = int(w * 0.1)  # 10% margin outside frame
+
+        # Step 1: Keep only intersections within frame + margin
+        filtered = []
+        for pt in intersections:
+            if -margin <= pt[0] <= w + margin and -margin <= pt[1] <= h + margin:
+                filtered.append(pt)
+
+        if len(filtered) < 3:
+            return None
+
+        pts = np.array(filtered, dtype=np.float32)
+
+        # Step 2: Convex hull of filtered points
+        hull = cv2.convexHull(pts)
+        hull_pts = hull.reshape(-1, 2)
+
+        # Step 3: Extend the polygon to the bottom of the frame.
+        # The camera looks down at the court, so the near baseline
+        # extends to the bottom of the frame. Add two corner points
+        # at the bottom spanning the hull's x-range.
+        x_min = float(hull_pts[:, 0].min())
+        x_max = float(hull_pts[:, 0].max())
+        bottom_pts = np.array([
+            [x_min, float(h)],
+            [x_max, float(h)],
+        ], dtype=np.float32)
+
+        all_pts = np.vstack([hull_pts, bottom_pts])
+        final_hull = cv2.convexHull(all_pts)
+        return final_hull.reshape(-1, 2).astype(np.float32)
+
+    def _filter_players_on_court(
+        self, detections: List[Detection]
+    ) -> List[Detection]:
+        """
+        Filter player detections to only those on or near the court.
+
+        Uses a two-stage approach:
+        1. Compute the court x-center from detected court intersections
+           or from the median of player x-positions.
+        2. Score each detection by court proximity, perspective-
+           consistent size, and confidence.  Hard-reject players
+           whose center_x is far from the court center.
+        3. Keep top max_players.
+        """
+        if not detections:
+            return detections
+
+        frame_w = self.frame_size[0] if self.frame_size else 1920
+        frame_h = self.frame_size[1] if self.frame_size else 1080
+
+        # Use frame center as court center (robust for typical
+        # broadcast angles where the main court is roughly centered).
+        court_cx = frame_w / 2.0
+        # Max allowed x-distance: ~40% of frame width
+        max_x_dist = frame_w * 0.40
+
+        scored = []
+        for det in detections:
+            x1, y1, x2, y2 = det.bbox
+            cx = (x1 + x2) / 2.0
+            foot_y = float(y2)
+            bbox_w = x2 - x1
+            bbox_h = y2 - y1
+            area = bbox_w * bbox_h
+
+            # --- Hard reject: too far from court center in x ---
+            x_dist = abs(cx - court_cx)
+            if x_dist > max_x_dist:
+                continue
+
+            # --- Court proximity score (x-distance from court center) ---
+            # Normalized so 0 = at center, 1 = at max_x_dist
+            x_norm = x_dist / max_x_dist if max_x_dist > 0 else 0
+            court_score = 1.0 - x_norm
+
+            # --- Perspective-consistent size score ---
+            # Players closer to the camera (larger foot_y) should be
+            # bigger.  Compute an expected height based on foot_y and
+            # penalize detections that deviate.
+            # Near-side (foot_y ~ frame_h) expect height ~ 300+
+            # Far-side  (foot_y ~ 0.25*frame_h) expect height ~ 80-120
+            expected_h = 50 + (foot_y / frame_h) * 300
+            size_ratio = min(bbox_h, expected_h) / max(bbox_h, expected_h)
+            size_score = size_ratio  # 0..1, 1 = perfect match
+
+            # --- Confidence ---
+            conf_score = det.confidence
+
+            # Combined score
+            total = (
+                conf_score * 0.15
+                + size_score * 0.25
+                + court_score * 0.60
+            )
+            scored.append((total, det))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        # Keep top max_players
+        max_p = self.config.max_players
+        return [s[1] for s in scored[:max_p]]
 
     def _build_output_frame(
         self, frame: np.ndarray, result: Dict

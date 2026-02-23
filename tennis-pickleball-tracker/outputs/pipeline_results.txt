@@ -1,0 +1,15 @@
+============================================================
+Pipeline Processing Complete!
+============================================================
+Input: data/raw/Video Project 4.mp4
+Output: outputs/Video_Project_4_tracked.avi
+File size: 152.2 MB
+Total frames: 1139
+Processing time: 636.5s
+Processing FPS: 1.8
+Ball detections: 633
+Bounce events: 4
+  Bounce 1: frame 69, (0.00, 10.97) - OUT (conf: 1.00)
+  Bounce 2: frame 91, (-0.00, 10.97) - OUT (conf: 1.00)
+  Bounce 3: frame 109, (0.00, 10.97) - OUT (conf: 1.00)
+  Bounce 4: frame 124, (0.00, 10.97) - OUT (conf: 1.00)

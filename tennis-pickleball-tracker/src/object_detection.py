@@ -210,63 +210,191 @@ class ClassicalBallDetector:
     Ball detection using classical feature engineering methods.
 
     Uses color segmentation (isolate bright yellow/green ball) +
-    Hough Circle Transform for circular shape detection.
+    contour analysis with circularity filtering + motion detection.
 
-    This is a baseline for comparison against deep learning methods.
+    Pipeline:
+    1. HSV color segmentation for yellow/green ball
+    2. Morphological cleanup
+    3. Contour detection with area + circularity filtering
+    4. Court region filtering (ignore background objects)
+    5. Motion-based filtering (ball moves between frames)
     """
 
-    def __init__(self):
-        # Tennis ball color range in HSV (bright yellow/green)
-        self.ball_lower_hsv = np.array([25, 80, 80])
-        self.ball_upper_hsv = np.array([45, 255, 255])
-        # Minimum and maximum radius (pixels)
-        self.min_radius = 2
-        self.max_radius = 20
+    def __init__(
+        self,
+        ball_lower_hsv: Optional[List[int]] = None,
+        ball_upper_hsv: Optional[List[int]] = None,
+        min_area: int = 3,
+        max_area: int = 600,
+        min_circularity: float = 0.3,
+        court_y_min_ratio: float = 0.25,
+    ):
+        # Tennis/pickleball ball HSV range (bright yellow-green)
+        self.ball_lower_hsv = np.array(ball_lower_hsv or [20, 50, 120])
+        self.ball_upper_hsv = np.array(ball_upper_hsv or [50, 255, 255])
+        # Contour area bounds (pixels²) for ball-sized objects
+        self.min_area = min_area
+        self.max_area = max_area
+        # Circularity threshold: 1.0 = perfect circle, lower = allow elongated
+        self.min_circularity = min_circularity
+        # Ignore detections in the top portion of frame (background/spectators)
+        # Ratio of frame height: objects above this are discarded
+        self.court_y_min_ratio = court_y_min_ratio
+        # Previous frame mask for motion detection
+        self._prev_mask: Optional[np.ndarray] = None
+        # Court polygon in image coords (set by pipeline when homography available)
+        self.court_polygon: Optional[np.ndarray] = None
+
+    def set_court_polygon(self, polygon: np.ndarray):
+        """Set court polygon for spatial filtering (from pipeline)."""
+        self.court_polygon = polygon
 
     def detect(
         self, frame: np.ndarray, confidence_threshold: float = 0.3
     ) -> List[Detection]:
         """
-        Detect ball using color segmentation + Hough Circles.
+        Detect ball using color segmentation + contour analysis.
 
         Returns list of Detection objects (usually 0 or 1 ball).
         """
+        h, w = frame.shape[:2]
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, self.ball_lower_hsv, self.ball_upper_hsv)
 
-        # Clean up
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        # Morphological cleanup with small kernel (ball is small)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
-        # Blur for Hough
-        blurred = cv2.GaussianBlur(mask, (9, 9), 2)
+        # --- Motion filtering: XOR with previous frame to find moving blobs ---
+        motion_mask = None
+        if self._prev_mask is not None:
+            motion_mask = cv2.absdiff(mask, self._prev_mask)
+            motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_DILATE, kernel, iterations=2)
+        self._prev_mask = mask.copy()
 
+        # --- Find contours ---
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        candidates = []
+        y_min_cutoff = int(h * self.court_y_min_ratio)
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < self.min_area or area > self.max_area:
+                continue
+
+            # Circularity filter
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter == 0:
+                continue
+            circularity = 4 * np.pi * area / (perimeter ** 2)
+            if circularity < self.min_circularity:
+                continue
+
+            # Center of contour
+            M = cv2.moments(contour)
+            if M["m00"] == 0:
+                continue
+            cx = M["m10"] / M["m00"]
+            cy = M["m01"] / M["m00"]
+
+            # Court region filter: ignore upper background area
+            if cy < y_min_cutoff:
+                continue
+
+            # Court polygon filter: if court polygon available, only keep
+            # detections inside or near the court
+            if self.court_polygon is not None:
+                dist = cv2.pointPolygonTest(
+                    self.court_polygon, (cx, cy), measureDist=True
+                )
+                # Allow some margin above the court (ball in flight)
+                if dist < -100:
+                    continue
+
+            # Motion score: check if this blob moved from previous frame
+            motion_score = 1.0
+            if motion_mask is not None:
+                # Sample motion mask at the contour location
+                x_int, y_int = int(cx), int(cy)
+                r = max(3, int(np.sqrt(area / np.pi)))
+                y1 = max(0, y_int - r)
+                y2 = min(h, y_int + r)
+                x1 = max(0, x_int - r)
+                x2 = min(w, x_int + r)
+                region = motion_mask[y1:y2, x1:x2]
+                if region.size > 0:
+                    motion_score = np.mean(region) / 255.0
+
+            # Confidence based on circularity and motion
+            conf = 0.3 * circularity + 0.4 * motion_score + 0.3 * min(1.0, area / 50.0)
+
+            r = max(3, int(np.sqrt(area / np.pi)))
+            candidates.append((
+                conf,
+                Detection(
+                    bbox=(int(cx - r), int(cy - r), int(cx + r), int(cy + r)),
+                    confidence=float(conf),
+                    class_id=0,
+                    class_name="ball",
+                    center=(float(cx), float(cy)),
+                ),
+            ))
+
+        # Sort by confidence and return the best candidate
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        detections = [c[1] for c in candidates[:3]]  # Top 3 candidates
+
+        # Also try Hough Circle as supplementary detection
+        hough_dets = self._detect_hough(mask, h, w, y_min_cutoff)
+        if hough_dets and not detections:
+            detections = hough_dets
+
+        return detections
+
+    def _detect_hough(
+        self, mask: np.ndarray, h: int, w: int, y_min_cutoff: int
+    ) -> List[Detection]:
+        """Supplementary Hough Circle detection."""
+        blurred = cv2.GaussianBlur(mask, (9, 9), 2)
         circles = cv2.HoughCircles(
             blurred,
             cv2.HOUGH_GRADIENT,
             dp=1.2,
             minDist=30,
             param1=50,
-            param2=20,
-            minRadius=self.min_radius,
-            maxRadius=self.max_radius,
+            param2=15,
+            minRadius=2,
+            maxRadius=20,
         )
-
         detections = []
         if circles is not None:
             circles = np.round(circles[0]).astype(int)
             for (cx, cy, r) in circles:
+                if cy < y_min_cutoff:
+                    continue
+                if self.court_polygon is not None:
+                    dist = cv2.pointPolygonTest(
+                        self.court_polygon, (float(cx), float(cy)), measureDist=True
+                    )
+                    if dist < -100:
+                        continue
                 det = Detection(
                     bbox=(cx - r, cy - r, cx + r, cy + r),
-                    confidence=0.5,
+                    confidence=0.4,
                     class_id=0,
                     class_name="ball",
                     center=(float(cx), float(cy)),
                 )
                 detections.append(det)
-
         return detections
+
+    def reset(self):
+        """Reset motion detection state."""
+        self._prev_mask = None
 
 
 # ============================================================================
@@ -291,6 +419,7 @@ class YOLODetector:
         iou_threshold: float = 0.45,
         device: str = "0",
         classes: Optional[List[int]] = None,
+        is_custom_model: bool = False,
     ):
         """
         Args:
@@ -299,6 +428,8 @@ class YOLODetector:
             iou_threshold: NMS IoU threshold
             device: CUDA device ("0") or "cpu"
             classes: List of class indices to detect (None = all)
+            is_custom_model: True if using a custom-trained model with
+                             {0: ball, 1: player} classes. False for COCO pretrained.
         """
         try:
             from ultralytics import YOLO
@@ -311,10 +442,19 @@ class YOLODetector:
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
         self.device = device
-        self.classes = classes
+        self.is_custom_model = is_custom_model
 
-        # Class mapping for custom-trained model
-        self.class_names = {0: "ball", 1: "player"}
+        if is_custom_model:
+            # Custom-trained model: {0: ball, 1: player}
+            self.class_names = {0: "ball", 1: "player"}
+            self.classes = classes
+        else:
+            # COCO pretrained model:
+            #   class 0  = "person"  -> mapped to "player"
+            #   class 32 = "sports ball" -> mapped to "ball"
+            self.class_names = {0: "player", 32: "ball"}
+            # Only detect person and sports ball from COCO
+            self.classes = classes if classes is not None else [0, 32]
 
     def detect(
         self, frame: np.ndarray, verbose: bool = False
