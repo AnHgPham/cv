@@ -857,8 +857,10 @@ class SegmentationCourtDetector:
                 if corners is None:
                     continue
 
-                H = ClassicalCourtDetector.compute_homography(
-                    corners[:4], court_keypoints[:4]
+                H, _ = cv2.findHomography(
+                    corners[:4].astype(np.float32),
+                    court_keypoints[:4].astype(np.float32),
+                    cv2.RANSAC, 5.0,
                 )
                 if H is None:
                     continue
