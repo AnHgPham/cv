@@ -720,6 +720,39 @@ class TennisPickleballPipeline:
                 annotated, result["player_tracks"]
             )
 
+        # Draw court boundary overlay when detected
+        if self.homography is not None:
+            try:
+                H_inv = np.linalg.inv(self.homography)
+                # Use pickleball court corners if pickleball mode
+                if self.config.court_type == "pickleball":
+                    court_pts = np.array([
+                        [0, 0], [0, 6.10], [13.41, 0], [13.41, 6.10],
+                        [2.13, 0], [2.13, 6.10],   # Kitchen near
+                        [11.28, 0], [11.28, 6.10],  # Kitchen far
+                        [6.705, 0], [6.705, 6.10],  # Net
+                    ], dtype=np.float32)
+                else:
+                    court_pts = TENNIS_COURT_CORNERS
+
+                from court_detection import transform_points
+                img_pts = transform_points(H_inv, court_pts).astype(int)
+
+                # Draw court outline (green)
+                if len(img_pts) >= 4:
+                    cv2.line(annotated, tuple(img_pts[0]), tuple(img_pts[1]), (0, 255, 0), 2)
+                    cv2.line(annotated, tuple(img_pts[1]), tuple(img_pts[3]), (0, 255, 0), 2)
+                    cv2.line(annotated, tuple(img_pts[3]), tuple(img_pts[2]), (0, 255, 0), 2)
+                    cv2.line(annotated, tuple(img_pts[2]), tuple(img_pts[0]), (0, 255, 0), 2)
+
+                # Draw kitchen lines (yellow) and net (white) for pickleball
+                if self.config.court_type == "pickleball" and len(img_pts) >= 10:
+                    cv2.line(annotated, tuple(img_pts[4]), tuple(img_pts[5]), (0, 255, 255), 2)  # Kitchen near
+                    cv2.line(annotated, tuple(img_pts[6]), tuple(img_pts[7]), (0, 255, 255), 2)  # Kitchen far
+                    cv2.line(annotated, tuple(img_pts[8]), tuple(img_pts[9]), (255, 255, 255), 2)  # Net
+            except Exception:
+                pass  # Skip overlay if homography inversion fails
+
         # Draw ball trajectory
         if self.config.show_trajectory and self.ball_pixel_positions:
             annotated = self.annotator.draw_ball_trajectory(

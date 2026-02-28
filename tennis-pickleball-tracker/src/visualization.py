@@ -284,12 +284,11 @@ class MiniMap:
         self,
         court_type: str = "tennis",
         map_width: int = 300,
-        map_height: int = 600,
+        map_height: int = None,
         margin: int = 30,
     ):
         self.court_type = court_type
         self.map_width = map_width
-        self.map_height = map_height
         self.margin = margin
 
         # Court dimensions in meters
@@ -300,10 +299,15 @@ class MiniMap:
             self.court_length = 13.41
             self.court_width = 6.10
 
-        # Scale: court coords -> map pixel coords
+        # Auto-calculate height from real court aspect ratio
         usable_w = map_width - 2 * margin
-        usable_h = map_height - 2 * margin
-        self.scale_x = usable_h / self.court_length
+        court_ratio = self.court_length / self.court_width
+        usable_h = int(usable_w * court_ratio)
+        self.map_height = usable_h + 2 * margin if map_height is None else map_height
+
+        # Scale: court coords -> map pixel coords
+        usable_h_final = self.map_height - 2 * margin
+        self.scale_x = usable_h_final / self.court_length
         self.scale_y = usable_w / self.court_width
 
         # Background court image (cached)
