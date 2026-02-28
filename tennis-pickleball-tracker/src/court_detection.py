@@ -98,6 +98,14 @@ PICKLEBALL_COURT_KEYPOINTS = np.array([
     [13.41, 6.10],     # Bottom-right
 ], dtype=np.float32)
 
+# Simplified 4-corner keypoints for pickleball homography
+PICKLEBALL_COURT_CORNERS = np.array([
+    [0.0, 0.0],        # Top-left
+    [0.0, 6.10],       # Top-right
+    [13.41, 0.0],      # Bottom-left
+    [13.41, 6.10],     # Bottom-right
+], dtype=np.float32)
+
 
 def load_court_config(config_path: str = "configs/court_config.yaml") -> dict:
     """Load court detection configuration from YAML file."""
@@ -160,6 +168,25 @@ class ClassicalCourtDetector:
 
         # RANSAC
         self.ransac_thresh = classical.get("ransac_reproj_threshold", 5.0)
+
+        # Court surface color (for fallback surface-based detection)
+        self.surface_lower = np.array(
+            classical.get("surface_lower_hsv", [85, 40, 80])
+        )
+        self.surface_upper = np.array(
+            classical.get("surface_upper_hsv", [130, 255, 255])
+        )
+
+        # Manual corners: pixel coordinates [TL, TR, BL, BR] as a
+        # fallback when automatic detection cannot isolate the main court.
+        manual = classical.get("manual_corners", None)
+        self.manual_corners = (
+            np.array(manual, dtype=np.float32) if manual else None
+        )
+
+        # ROI: fraction of frame height to ignore from top (removes
+        # scoreboards, banners in indoor scenes).  0.0 = no crop.
+        self.roi_top_crop = classical.get("roi_top_crop", 0.0)
 
     def preprocess(self, frame: np.ndarray) -> np.ndarray:
         """
@@ -228,23 +255,34 @@ class ClassicalCourtDetector:
 
     @staticmethod
     def merge_similar_lines(
-        lines: List[np.ndarray], distance_thresh: float = 30.0
+        lines: List[np.ndarray],
+        distance_thresh: float = 30.0,
+        use_x: bool = False,
     ) -> List[np.ndarray]:
         """
         Merge lines that are close together (likely the same court line).
 
         Groups lines by proximity and averages each group into one line.
+
+        Args:
+            use_x: If True, merge by x-midpoint (for vertical lines).
+                   If False, merge by y-midpoint (for horizontal lines).
         """
         if not lines:
             return []
 
-        lines = sorted(lines, key=lambda l: (l[1] + l[3]) / 2)
+        if use_x:
+            mid_fn = lambda l: (l[0] + l[2]) / 2
+        else:
+            mid_fn = lambda l: (l[1] + l[3]) / 2
+
+        lines = sorted(lines, key=mid_fn)
         merged = []
         current_group = [lines[0]]
 
         for i in range(1, len(lines)):
-            mid_prev = (current_group[-1][1] + current_group[-1][3]) / 2
-            mid_curr = (lines[i][1] + lines[i][3]) / 2
+            mid_prev = mid_fn(current_group[-1])
+            mid_curr = mid_fn(lines[i])
 
             if abs(mid_curr - mid_prev) < distance_thresh:
                 current_group.append(lines[i])
@@ -344,7 +382,14 @@ class ClassicalCourtDetector:
         }
 
         # Step 1-3: Preprocess
-        mask = self.preprocess(frame)
+        h_frame, w_frame = frame.shape[:2]
+        work = frame
+        y_offset = 0
+        if self.roi_top_crop > 0:
+            y_offset = int(h_frame * self.roi_top_crop)
+            work = frame[y_offset:, :]
+
+        mask = self.preprocess(work)
         result["mask"] = mask
 
         # Step 4: Edge detection
@@ -355,14 +400,20 @@ class ClassicalCourtDetector:
         raw_lines = self.detect_lines(edges)
         if raw_lines is None or len(raw_lines) == 0:
             return result
+
+        # Shift line coordinates back to full-frame if ROI was applied
+        if y_offset > 0:
+            raw_lines = raw_lines.copy()
+            raw_lines[:, 0, 1] += y_offset
+            raw_lines[:, 0, 3] += y_offset
         result["lines"] = raw_lines
 
         # Step 6: Classify lines
         horizontal, vertical = self.classify_lines(raw_lines)
 
-        # Merge similar lines
-        horizontal = self.merge_similar_lines(horizontal, distance_thresh=30)
-        vertical = self.merge_similar_lines(vertical, distance_thresh=30)
+        # Merge similar lines (horizontal by y-midpoint, vertical by x-midpoint)
+        horizontal = self.merge_similar_lines(horizontal, distance_thresh=30, use_x=False)
+        vertical = self.merge_similar_lines(vertical, distance_thresh=30, use_x=True)
         result["horizontal"] = horizontal
         result["vertical"] = vertical
 
@@ -380,29 +431,159 @@ class ClassicalCourtDetector:
         """
         Detect court lines and compute homography to court coordinates.
 
-        Automatically selects the best 4 corner points from intersections
-        and maps them to the standard court corners.
+        Uses a two-pass strategy: first try with standard Hough parameters,
+        then retry with relaxed thresholds if insufficient lines are found.
+        Validates the resulting homography for geometric plausibility.
 
         Returns:
             (homography_matrix, detection_result_dict)
         """
         result = self.detect(frame)
-        intersections = result["intersections"]
+        H, result = self._try_homography(result, frame, court_keypoints)
 
+        if H is not None:
+            return H, result
+
+        # Retry with relaxed Hough parameters to capture fainter baselines
+        relaxed_thresh = max(40, self.hough_threshold - 40)
+        relaxed_min_len = max(25, self.hough_min_line_length - 25)
+        saved = (self.hough_threshold, self.hough_min_line_length)
+        self.hough_threshold = relaxed_thresh
+        self.hough_min_line_length = relaxed_min_len
+
+        result2 = self.detect(frame)
+        H2, result2 = self._try_homography(result2, frame, court_keypoints)
+
+        self.hough_threshold, self.hough_min_line_length = saved
+
+        if H2 is not None:
+            return H2, result2
+
+        # Third pass: detect court by surface color (robust in multi-court scenes)
+        surface_corners = self.detect_court_surface(frame)
+        if surface_corners is not None and len(surface_corners) >= 4:
+            H3 = self.compute_homography(
+                surface_corners[:4], court_keypoints[:4]
+            )
+            if self._validate_homography(H3, frame.shape, court_keypoints[:4]):
+                result["homography"] = H3
+                result["selected_corners"] = surface_corners
+                return H3, result
+
+        # Final fallback: manual corners from config (for known camera setups)
+        if self.manual_corners is not None and len(self.manual_corners) >= 4:
+            H4 = self.compute_homography(
+                self.manual_corners[:4], court_keypoints[:4]
+            )
+            if H4 is not None:
+                result["homography"] = H4
+                result["selected_corners"] = self.manual_corners
+                return H4, result
+
+        return None, result
+
+    def _try_homography(
+        self,
+        result: Dict,
+        frame: np.ndarray,
+        court_keypoints: np.ndarray,
+    ) -> Tuple[Optional[np.ndarray], Dict]:
+        """Attempt corner selection + homography from a detection result."""
+        intersections = result["intersections"]
         if len(intersections) < 4:
             return None, result
 
-        # Select 4 corner-like points (top-left, top-right, bottom-left, bottom-right)
         pts = np.array(intersections, dtype=np.float32)
         corners = self._select_court_corners(pts, frame.shape)
 
         if corners is not None and len(corners) >= 4:
             H = self.compute_homography(corners[:4], court_keypoints[:4])
-            result["homography"] = H
-            result["selected_corners"] = corners
-            return H, result
+            if self._validate_homography(H, frame.shape, court_keypoints[:4]):
+                result["homography"] = H
+                result["selected_corners"] = corners
+                return H, result
 
         return None, result
+
+    @staticmethod
+    def _validate_homography(
+        H: Optional[np.ndarray],
+        frame_shape: Tuple,
+        court_corners: np.ndarray = TENNIS_COURT_CORNERS,
+    ) -> bool:
+        """
+        Validate a homography matrix for geometric plausibility.
+
+        Checks:
+        1. H is finite and invertible
+        2. Projected court polygon lies near the frame
+        3. Projected polygon is convex (4-vertex hull)
+        4. Projected area is between 5% and 90% of frame
+        5. Round-trip reprojection error < 0.5 m
+        """
+        if H is None:
+            return False
+        if not np.all(np.isfinite(H)):
+            return False
+        if abs(np.linalg.det(H)) < 1e-8:
+            return False
+
+        try:
+            H_inv = np.linalg.inv(H)
+        except np.linalg.LinAlgError:
+            return False
+
+        h, w = frame_shape[:2]
+        court_pts = court_corners.reshape(-1, 1, 2).astype(np.float32)
+
+        img_pts = cv2.perspectiveTransform(court_pts, H_inv).reshape(-1, 2)
+        if not np.all(np.isfinite(img_pts)):
+            return False
+
+        max_range = max(w, h) * 2
+        if (np.any(img_pts < -max_range)
+                or np.any(img_pts[:, 0] > w + max_range)
+                or np.any(img_pts[:, 1] > h + max_range)):
+            return False
+
+        hull = cv2.convexHull(img_pts.astype(np.float32))
+        if len(hull) != 4:
+            return False
+
+        area = cv2.contourArea(hull)
+        frame_area = h * w
+        if area < frame_area * 0.05 or area > frame_area * 0.90:
+            return False
+
+        # Span check: projected court should cover a reasonable fraction
+        # of the frame in both x and y (rejects degenerate narrow strips).
+        width_span = float(img_pts[:, 0].max() - img_pts[:, 0].min())
+        height_span = float(img_pts[:, 1].max() - img_pts[:, 1].min())
+        if width_span < w * 0.25 or height_span < h * 0.25:
+            return False
+
+        # Perspective ratio: the far side (TL-TR, smaller y) should be at
+        # least 15% as wide as the near side (BL-BR, larger y).  Rejects
+        # degenerate triangles from clustered center-line intersections.
+        # img_pts order: [TL, TR, BL, BR] matching TENNIS_COURT_CORNERS.
+        if len(img_pts) == 4:
+            far_width = float(np.linalg.norm(img_pts[1] - img_pts[0]))
+            near_width = float(np.linalg.norm(img_pts[3] - img_pts[2]))
+            if near_width > 1.0:
+                ratio = far_width / near_width
+                if ratio < 0.15 or ratio > 3.0:
+                    return False
+
+        reprojected = cv2.perspectiveTransform(
+            cv2.perspectiveTransform(court_pts, H_inv), H
+        ).reshape(-1, 2)
+        reproj_error = float(np.mean(
+            np.linalg.norm(reprojected - court_corners, axis=1)
+        ))
+        if reproj_error > 0.5:
+            return False
+
+        return True
 
     @staticmethod
     def _select_court_corners(
@@ -411,29 +592,284 @@ class ClassicalCourtDetector:
         """
         Select 4 court corner points from candidate intersections.
 
-        Uses centroid-based sorting: compute centroid, then classify
-        points into quadrants (TL, TR, BL, BR).
+        Strategy:
+        1. Filter points to frame boundaries.
+        2. Compute convex hull; reject if hull area is too small
+           (intersections clustered in a narrow strip).
+        3. Among hull vertices, pick the 4 that maximize quadrilateral area.
+        4. Order as TL, TR, BL, BR for homography correspondence.
         """
         if len(points) < 4:
             return None
 
         h, w = frame_shape[:2]
-        cx = np.mean(points[:, 0])
-        cy = np.mean(points[:, 1])
+        margin = 50
 
-        tl_candidates = points[(points[:, 0] < cx) & (points[:, 1] < cy)]
-        tr_candidates = points[(points[:, 0] >= cx) & (points[:, 1] < cy)]
-        bl_candidates = points[(points[:, 0] < cx) & (points[:, 1] >= cy)]
-        br_candidates = points[(points[:, 0] >= cx) & (points[:, 1] >= cy)]
+        # Keep only points near the frame
+        mask = (
+            (points[:, 0] >= -margin) & (points[:, 0] <= w + margin)
+            & (points[:, 1] >= -margin) & (points[:, 1] <= h + margin)
+        )
+        pts = points[mask]
+        if len(pts) < 4:
+            return None
 
-        corners = []
-        for candidates in [tl_candidates, tr_candidates, bl_candidates, br_candidates]:
-            if len(candidates) == 0:
-                return None
-            # Pick the point closest to the respective image corner
-            corners.append(candidates[0])
+        hull = cv2.convexHull(pts.astype(np.float32))
+        hull_pts = hull.reshape(-1, 2)
+        if len(hull_pts) < 4:
+            return None
 
-        return np.array(corners, dtype=np.float32)
+        hull_area = cv2.contourArea(hull)
+        if hull_area < h * w * 0.01:
+            return None
+
+        # Find 4 hull vertices forming the largest-area quadrilateral
+        from itertools import combinations
+
+        best_area = 0.0
+        best_quad = None
+        n = len(hull_pts)
+
+        for indices in combinations(range(n), 4):
+            quad = hull_pts[list(indices)]
+            cx_q, cy_q = quad.mean(axis=0)
+            angles = np.arctan2(quad[:, 1] - cy_q, quad[:, 0] - cx_q)
+            order = np.argsort(angles)
+            quad = quad[order]
+            area = 0.5 * abs(float(
+                np.sum(
+                    quad[:, 0] * np.roll(quad[:, 1], -1)
+                    - np.roll(quad[:, 0], -1) * quad[:, 1]
+                )
+            ))
+            if area > best_area:
+                best_area = area
+                best_quad = quad.copy()
+
+        if best_quad is None or best_area < h * w * 0.01:
+            return None
+
+        # Order as TL, TR, BL, BR
+        sums = best_quad[:, 0] + best_quad[:, 1]
+        diffs = best_quad[:, 1] - best_quad[:, 0]
+        tl_idx = int(np.argmin(sums))
+        br_idx = int(np.argmax(sums))
+        tr_idx = int(np.argmin(diffs))
+        bl_idx = int(np.argmax(diffs))
+
+        if len({tl_idx, tr_idx, bl_idx, br_idx}) == 4:
+            return np.array(
+                [best_quad[tl_idx], best_quad[tr_idx],
+                 best_quad[bl_idx], best_quad[br_idx]],
+                dtype=np.float32,
+            )
+
+        # Fallback ordering when indices collide
+        order = np.argsort(sums)
+        tl = best_quad[order[0]]
+        br = best_quad[order[3]]
+        remaining = best_quad[order[1:3]]
+        if remaining[0][0] > remaining[1][0]:
+            tr, bl = remaining[0], remaining[1]
+        else:
+            tr, bl = remaining[1], remaining[0]
+        return np.array([tl, tr, bl, br], dtype=np.float32)
+
+    def detect_court_surface(
+        self, frame: np.ndarray
+    ) -> Optional[np.ndarray]:
+        """
+        Detect the main court by its surface color and return 4 corners.
+
+        Segments the court surface (blue/cyan), finds the largest quadrilateral
+        contour, and returns its 4 corner points ordered as TL, TR, BL, BR.
+
+        More robust than Hough-line-based detection in multi-court scenes
+        because it isolates the single largest playing surface.
+        """
+        h, w = frame.shape[:2]
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        mask = cv2.inRange(hsv, self.surface_lower, self.surface_upper)
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if not contours:
+            return None
+
+        largest = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(largest)
+        if area < h * w * 0.03:
+            return None
+
+        peri = cv2.arcLength(largest, True)
+        for eps_mult in [0.02, 0.03, 0.05, 0.08, 0.10]:
+            approx = cv2.approxPolyDP(largest, eps_mult * peri, True)
+            if len(approx) == 4:
+                pts = approx.reshape(4, 2).astype(np.float32)
+                sums = pts[:, 0] + pts[:, 1]
+                diffs = pts[:, 1] - pts[:, 0]
+                tl = pts[int(np.argmin(sums))]
+                br = pts[int(np.argmax(sums))]
+                tr = pts[int(np.argmin(diffs))]
+                bl = pts[int(np.argmax(diffs))]
+                return np.array([tl, tr, bl, br], dtype=np.float32)
+
+        rect = cv2.minAreaRect(largest)
+        box = cv2.boxPoints(rect).astype(np.float32)
+        sums = box[:, 0] + box[:, 1]
+        diffs = box[:, 1] - box[:, 0]
+        tl = box[int(np.argmin(sums))]
+        br = box[int(np.argmax(sums))]
+        tr = box[int(np.argmin(diffs))]
+        bl = box[int(np.argmax(diffs))]
+        return np.array([tl, tr, bl, br], dtype=np.float32)
+
+
+# ============================================================================
+# Segmentation-based Court Detector (YOLOv8-seg for Pickleball)
+# ============================================================================
+
+def extract_court_corners_from_segmentation(
+    mask_or_polygon, frame_shape: Tuple
+) -> Optional[np.ndarray]:
+    """
+    Extract 4 court corners from a segmentation polygon or mask.
+
+    Reorders to TL, TR, BL, BR for homography correspondence with
+    PICKLEBALL_COURT_CORNERS.
+    """
+    if isinstance(mask_or_polygon, np.ndarray) and mask_or_polygon.ndim == 2:
+        contours, _ = cv2.findContours(
+            mask_or_polygon.astype(np.uint8),
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        if not contours:
+            return None
+        largest = max(contours, key=cv2.contourArea)
+        peri = cv2.arcLength(largest, True)
+        for eps in [0.02, 0.03, 0.05, 0.08]:
+            approx = cv2.approxPolyDP(largest, eps * peri, True)
+            if len(approx) == 4:
+                pts = approx.reshape(4, 2).astype(np.float32)
+                break
+        else:
+            pts = cv2.boxPoints(cv2.minAreaRect(largest)).astype(np.float32)
+    else:
+        pts = np.array(mask_or_polygon, dtype=np.float32)
+        if len(pts) > 4:
+            peri = cv2.arcLength(pts.reshape(-1, 1, 2).astype(np.float32), True)
+            for eps in [0.02, 0.03, 0.05]:
+                approx = cv2.approxPolyDP(
+                    pts.reshape(-1, 1, 2).astype(np.float32), eps * peri, True
+                )
+                if len(approx) == 4:
+                    pts = approx.reshape(4, 2).astype(np.float32)
+                    break
+
+    if len(pts) < 4:
+        return None
+
+    pts = pts[:4]
+    sums = pts[:, 0] + pts[:, 1]
+    diffs = pts[:, 1] - pts[:, 0]
+    tl = pts[int(np.argmin(sums))]
+    br = pts[int(np.argmax(sums))]
+    tr = pts[int(np.argmin(diffs))]
+    bl = pts[int(np.argmax(diffs))]
+
+    return np.array([tl, tr, bl, br], dtype=np.float32)
+
+
+class SegmentationCourtDetector:
+    """
+    Court detection using YOLOv8-seg for pickleball courts.
+
+    Uses a trained segmentation model to detect court polygon, then extracts
+    4 corners and computes homography to PICKLEBALL_COURT_CORNERS.
+    """
+
+    def __init__(self, model_path: str, conf_threshold: float = 0.3):
+        self.model_path = model_path
+        self.conf_threshold = conf_threshold
+        self._model = None
+
+    def _get_model(self):
+        """Lazy-load YOLOv8-seg model."""
+        if self._model is not None:
+            return self._model
+        try:
+            from ultralytics import YOLO
+            self._model = YOLO(self.model_path)
+            return self._model
+        except Exception as e:
+            raise RuntimeError(
+                f"Cannot load pickleball court model {self.model_path}: {e}"
+            ) from e
+
+    def detect_and_compute_homography(
+        self,
+        frame: np.ndarray,
+        court_keypoints: np.ndarray = PICKLEBALL_COURT_CORNERS,
+    ) -> Tuple[Optional[np.ndarray], Dict]:
+        """
+        Run segmentation, extract 4 corners, compute homography.
+
+        Returns:
+            (homography_matrix, result_dict)
+        """
+        result = {
+            "method": "segmentation",
+            "mask": None,
+            "selected_corners": None,
+            "homography": None,
+        }
+        if not os.path.exists(self.model_path):
+            return None, result
+
+        try:
+            model = self._get_model()
+        except RuntimeError:
+            return None, result
+
+        preds = model(frame, conf=self.conf_threshold, verbose=False)
+
+        for r in preds:
+            if r.masks is None:
+                continue
+            for j, (mask_data, box) in enumerate(zip(r.masks, r.boxes)):
+                cls_id = int(box.cls[0])
+                cls_name = r.names.get(cls_id, str(cls_id))
+                if cls_name != "Court":
+                    continue
+
+                xy = mask_data.xy[j] if hasattr(mask_data, "xy") else None
+                if xy is None:
+                    continue
+
+                corners = extract_court_corners_from_segmentation(xy, frame.shape)
+                if corners is None:
+                    continue
+
+                H = ClassicalCourtDetector.compute_homography(
+                    corners[:4], court_keypoints[:4]
+                )
+                if H is None:
+                    continue
+                if ClassicalCourtDetector._validate_homography(
+                    H, frame.shape, court_keypoints[:4]
+                ):
+                    result["selected_corners"] = corners
+                    result["homography"] = H
+                    return H, result
+
+        return None, result
 
 
 # ============================================================================

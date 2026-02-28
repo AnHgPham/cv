@@ -60,6 +60,32 @@ classical:
   
   # RANSAC
   ransac_reproj_threshold: 5.0
+  
+  # Court surface color (HSV range for blue/cyan courts)
+  surface_lower_hsv: [85, 40, 80]
+  surface_upper_hsv: [130, 255, 255]
+  
+  # ROI: fraction of frame height to ignore from top (0.0 = no crop).
+  # Set to 0.25-0.35 for indoor scenes with scoreboards/banners.
+  roi_top_crop: 0.0
+  
+  # Manual court corners [TL, TR, BL, BR] in pixel coordinates.
+  # These are VIDEO-SPECIFIC (not universal). Each new video needs
+  # its own corners or auto-detection must work.
+  
+  # --- Tennis: "Video Project 4.mp4" outdoor static camera ---
+  manual_corners:
+    - [835, 265]     # TL: far-left baseline
+    - [1185, 265]    # TR: far-right baseline
+    - [470, 880]     # BL: near-left baseline
+    - [1635, 895]    # BR: near-right baseline
+  
+  # --- Pickleball: BUBADU OPEN indoor camera (video-specific) ---
+  # manual_corners:
+  #   - [555, 178]     # TL: far-left baseline
+  #   - [790, 177]     # TR: far-right baseline
+  #   - [315, 585]     # BL: near-left baseline
+  #   - [1090, 595]    # BR: near-right baseline
 
 # Deep Learning Court Detection
 deep_learning:

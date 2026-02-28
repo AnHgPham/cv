@@ -491,7 +491,8 @@ class DeepSORTTracker:
             if not track.is_confirmed():
                 continue
 
-            track_id = track.track_id
+            raw_id = track.track_id
+            track_id = int(raw_id) if isinstance(raw_id, (int, float)) else hash(raw_id) % 10000
             ltrb = track.to_ltrb()  # [left, top, right, bottom]
 
             det = Detection(

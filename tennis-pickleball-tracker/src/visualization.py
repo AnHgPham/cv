@@ -113,7 +113,8 @@ class FrameAnnotator:
         annotated = frame.copy()
 
         for track_id, det in tracked:
-            color = PLAYER_COLORS[track_id % len(PLAYER_COLORS)]
+            tid = int(track_id) if isinstance(track_id, (int, float)) else hash(track_id)
+            color = PLAYER_COLORS[tid % len(PLAYER_COLORS)]
             x1, y1, x2, y2 = det.bbox
 
             cv2.rectangle(

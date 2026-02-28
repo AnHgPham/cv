@@ -31,6 +31,8 @@ try:
         DeepCourtDetector,
         SIFTCourtMatcher,
         transform_point,
+        TENNIS_COURT_CORNERS,
+        PICKLEBALL_COURT_CORNERS,
     )
     from .object_detection import (
         Detection,
@@ -63,6 +65,8 @@ except ImportError:
         DeepCourtDetector,
         SIFTCourtMatcher,
         transform_point,
+        TENNIS_COURT_CORNERS,
+        PICKLEBALL_COURT_CORNERS,
     )
     from object_detection import (
         Detection,
@@ -159,8 +163,16 @@ class TennisPickleballPipeline:
         cfg = self.config
 
         # Module 1: Court Detection
-        self.court_detector = ClassicalCourtDetector()
+        from .court_detection import load_court_config
+        court_cfg = load_court_config("configs/court_config.yaml")
+        self.court_detector = ClassicalCourtDetector(court_cfg)
         self.sift_matcher = SIFTCourtMatcher()
+
+        # Select court corner model based on court type
+        if cfg.court_type == "pickleball":
+            self.court_corners = PICKLEBALL_COURT_CORNERS
+        else:
+            self.court_corners = TENNIS_COURT_CORNERS
 
         # Module 2: Object Detection
         self.ball_detectors = {}
@@ -230,6 +242,7 @@ class TennisPickleballPipeline:
         # State
         self.homography: Optional[np.ndarray] = None
         self.homography_inv: Optional[np.ndarray] = None
+        self.prev_valid_homography: Optional[np.ndarray] = None
         self.court_image_polygon: Optional[np.ndarray] = None
         self.frame_size: Optional[Tuple[int, int]] = None  # (width, height)
         self.ball_pixel_positions: List[Tuple[float, float]] = []
@@ -383,23 +396,34 @@ class TennisPickleballPipeline:
 
         # ---- Module 1: Court Detection ----
         if self.homography is None or frame_idx % 30 == 0:
-            # Re-detect court periodically (handles camera movement)
             H, court_result = self.court_detector.detect_and_compute_homography(
-                frame
+                frame, court_keypoints=self.court_corners
             )
-            if H is not None:
-                self.homography = H
-                result["court_detected"] = True
-                result["homography"] = H
 
-                # Build court polygon from detected intersections.
-                # Filter out noise (intersections far outside frame),
-                # then extend polygon to frame bottom for near-side players.
-                # Prefer homography-based polygon (projects real court
-                # corners to image space — tight and accurate).
-                # Fall back to intersection-based polygon if H is bad.
+            if H is not None:
+                # Check temporal consistency: if we already have a valid
+                # homography, reject the new one if it deviates too much
+                # (likely a mis-detection on a noisy frame).
+                if self.prev_valid_homography is not None:
+                    diff = np.linalg.norm(
+                        H / H[2, 2] - self.prev_valid_homography / self.prev_valid_homography[2, 2]
+                    )
+                    if diff > 5.0:
+                        H = self.prev_valid_homography
+                self.homography = H
+                self.prev_valid_homography = H.copy()
+            elif self.prev_valid_homography is not None:
+                self.homography = self.prev_valid_homography
+
+            if self.homography is not None:
+                result["court_detected"] = True
+                result["homography"] = self.homography
+
+                court_l = 13.41 if self.config.court_type == "pickleball" else 23.77
+                court_w = 6.10 if self.config.court_type == "pickleball" else 10.97
                 poly = self._build_court_polygon_from_homography(
-                    H, frame.shape
+                    self.homography, frame.shape,
+                    court_length=court_l, court_width=court_w,
                 )
                 if poly is None and court_result.get("intersections"):
                     poly = self._build_court_polygon(
@@ -408,20 +432,23 @@ class TennisPickleballPipeline:
                 if poly is not None:
                     self.court_image_polygon = poly
 
-                # Pass court polygon to classical ball detector
-                if "classical" in self.ball_detectors:
+                if "classical" in self.ball_detectors and self.court_image_polygon is not None:
                     self.ball_detectors["classical"].set_court_polygon(
                         self.court_image_polygon.astype(np.int32)
                     )
 
-                # Initialize/update 3D reconstructor
                 if self.trajectory_reconstructor is None:
-                    fps = 30.0  # Default; overridden in process_video
+                    fps = 30.0
                     self.trajectory_reconstructor = TrajectoryReconstructor(
-                        homography=H,
+                        homography=self.homography,
                         fps=fps,
                         court_type=f"{self.config.court_type}_singles",
                     )
+
+        # Report court status even on non-redetection frames
+        if self.homography is not None and not result["court_detected"]:
+            result["court_detected"] = True
+            result["homography"] = self.homography
 
         # ---- Module 2: Object Detection ----
         ball_detection = None
@@ -490,6 +517,8 @@ class TennisPickleballPipeline:
         H: np.ndarray,
         frame_shape: Tuple,
         padding_m: float = 2.0,
+        court_length: float = 23.77,
+        court_width: float = 10.97,
     ) -> Optional[np.ndarray]:
         """
         Build court polygon by projecting standard court corners through
@@ -497,12 +526,6 @@ class TennisPickleballPipeline:
 
         This is much more accurate than using raw intersections, since it
         only outlines the *main* court and ignores adjacent courts.
-
-        Args:
-            H: 3x3 homography mapping image -> court coordinates
-            frame_shape: (height, width, ...)
-            padding_m: meters of padding around the court (for players
-                        standing just outside the lines)
         """
         try:
             H_inv = np.linalg.inv(H)
@@ -511,12 +534,11 @@ class TennisPickleballPipeline:
 
         h, w = frame_shape[:2]
 
-        # Tennis court dimensions: 23.77m x 10.97m (doubles width)
         court_pts = np.array([
-            [-padding_m,              -padding_m],               # top-left
-            [-padding_m,              10.97 + padding_m],        # top-right
-            [23.77 + padding_m,       10.97 + padding_m],        # bottom-right
-            [23.77 + padding_m,       -padding_m],               # bottom-left
+            [-padding_m,                  -padding_m],
+            [-padding_m,                  court_width + padding_m],
+            [court_length + padding_m,    court_width + padding_m],
+            [court_length + padding_m,    -padding_m],
         ], dtype=np.float32)
 
         # Project court corners to image space using cv2.perspectiveTransform
@@ -702,8 +724,23 @@ class TennisPickleballPipeline:
         minimap_img = None
         if self.config.show_minimap:
             ball_court = result.get("ball_court_position")
+
+            player_court_positions = None
+            if self.homography is not None and result["player_tracks"]:
+                player_court_positions = []
+                for _track_id, det in result["player_tracks"]:
+                    foot_x = (det.bbox[0] + det.bbox[2]) / 2.0
+                    foot_y = float(det.bbox[3])
+                    court_pos = transform_point(
+                        self.homography, np.array([foot_x, foot_y])
+                    )
+                    player_court_positions.append(
+                        (float(court_pos[0]), float(court_pos[1]))
+                    )
+
             minimap_img = self.minimap.render(
                 ball_court_pos=ball_court,
+                player_court_positions=player_court_positions,
             )
 
         # Composite

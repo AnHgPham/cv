@@ -1,4 +1,20 @@
+# ===========================
+# Data & Datasets
+# ===========================
+data/
+
+# ===========================
+# Model weights
+# ===========================
+*.pt
+*.pth
+*.onnx
+*.weights
+models/
+
+# ===========================
 # Video files
+# ===========================
 *.mp4
 *.avi
 *.mov
@@ -6,45 +22,71 @@
 *.wmv
 *.flv
 
-# Large output files
-outputs/
-*.weights
-*.pt
-*.pth
-*.onnx
+# ===========================
+# Image files
+# ===========================
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tif
+*.tiff
+*.gif
 
+# ===========================
+# Outputs & generated files
+# ===========================
+outputs/
+error.txt
+
+# ===========================
+# Jupyter Notebooks
+# ===========================
+*.ipynb
+.ipynb_checkpoints/
+
+# ===========================
 # Python cache
+# ===========================
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .Python
 *.so
+*.egg-info/
+dist/
+build/
+*.egg
 
-# Jupyter
-.ipynb_checkpoints/
-*.ipynb_checkpoints
+# ===========================
+# Virtual environments
+# ===========================
+venv/
+env/
+.venv/
+.env
 
-# IDE
+# ===========================
+# IDE & Editor
+# ===========================
 .vscode/
 .idea/
 *.swp
 *.swo
+*.sublime-project
+*.sublime-workspace
 
-# OS
+# ===========================
+# OS generated
+# ===========================
 .DS_Store
 Thumbs.db
+Desktop.ini
 
-# Data
-data/raw/*.mp4
-data/raw/*.avi
-data/processed/
-
-# Models
-models/*.pt
-models/*.pth
-models/*.weights
-
-# Temp files
+# ===========================
+# Misc
+# ===========================
 *.tmp
 *.log
+*.bak
