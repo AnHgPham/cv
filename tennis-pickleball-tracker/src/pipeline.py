@@ -170,7 +170,10 @@ class TennisPickleballPipeline:
         cfg = self.config
 
         # Module 1: Court Detection
-        from .court_detection import load_court_config
+        try:
+            from .court_detection import load_court_config
+        except ImportError:
+            from court_detection import load_court_config
         court_cfg = load_court_config("configs/court_config.yaml")
         self.sift_matcher = SIFTCourtMatcher()
 
