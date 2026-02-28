@@ -94,3 +94,8 @@ deep_learning:
   input_size: [640, 360]
   weights: models/court_detector/court_keypoint_best.pt
   confidence_threshold: 0.5
+
+# Segmentation-based Court Detection (YOLOv8-seg for Pickleball)
+segmentation:
+  model_path: models/pickleball_court/best.pt
+  confidence_threshold: 0.3

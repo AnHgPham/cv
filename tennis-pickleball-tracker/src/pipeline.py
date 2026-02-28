@@ -29,6 +29,7 @@ try:
     from .court_detection import (
         ClassicalCourtDetector,
         DeepCourtDetector,
+        SegmentationCourtDetector,
         SIFTCourtMatcher,
         transform_point,
         TENNIS_COURT_CORNERS,
@@ -63,6 +64,7 @@ except ImportError:
     from court_detection import (
         ClassicalCourtDetector,
         DeepCourtDetector,
+        SegmentationCourtDetector,
         SIFTCourtMatcher,
         transform_point,
         TENNIS_COURT_CORNERS,
@@ -120,6 +122,11 @@ class PipelineConfig:
         # TrackNet weights
         self.tracknet_weights = self.config.get("tracknet_weights", None)
 
+        # Pickleball segmentation model path
+        self.seg_model_path = self.config.get(
+            "seg_model_path", "models/pickleball_court/best.pt"
+        )
+
         # Court type: "tennis" or "pickleball"
         self.court_type = self.config.get("court_type", "tennis")
 
@@ -165,14 +172,25 @@ class TennisPickleballPipeline:
         # Module 1: Court Detection
         from .court_detection import load_court_config
         court_cfg = load_court_config("configs/court_config.yaml")
-        self.court_detector = ClassicalCourtDetector(court_cfg)
         self.sift_matcher = SIFTCourtMatcher()
 
         # Select court corner model based on court type
         if cfg.court_type == "pickleball":
             self.court_corners = PICKLEBALL_COURT_CORNERS
+            # Use segmentation model for pickleball if available
+            if cfg.seg_model_path and os.path.exists(cfg.seg_model_path):
+                self.court_detector = SegmentationCourtDetector(
+                    model_path=cfg.seg_model_path,
+                    conf_threshold=0.3,
+                )
+                print(f"[Pipeline] Using SegmentationCourtDetector: {cfg.seg_model_path}")
+            else:
+                self.court_detector = ClassicalCourtDetector(court_cfg)
+                print(f"[Pipeline] Seg model not found at '{cfg.seg_model_path}', "
+                      f"falling back to ClassicalCourtDetector")
         else:
             self.court_corners = TENNIS_COURT_CORNERS
+            self.court_detector = ClassicalCourtDetector(court_cfg)
 
         # Module 2: Object Detection
         self.ball_detectors = {}
