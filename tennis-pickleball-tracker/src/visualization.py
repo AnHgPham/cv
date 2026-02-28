@@ -324,15 +324,16 @@ class MiniMap:
     def _draw_court(self) -> np.ndarray:
         """Draw the base court layout (lines, service areas, etc.)."""
         img = np.zeros((self.map_height, self.map_width, 3), dtype=np.uint8)
-        img[:] = (40, 80, 40)  # Dark green background
+        img[:] = (40, 80, 40)  # Dark green surround
 
         color = (255, 255, 255)
-        thickness = 1
 
         if self.court_type == "tennis":
-            # Outer rectangle (doubles)
+            thickness = 1
+            # Fill court area blue
             tl = self._court_to_pixel(0, 0)
             br = self._court_to_pixel(23.77, 10.97)
+            cv2.rectangle(img, tl, br, (140, 80, 40), -1)  # Blue court
             cv2.rectangle(img, tl, br, color, thickness)
 
             # Singles sidelines
@@ -359,13 +360,28 @@ class MiniMap:
             nr = self._court_to_pixel(11.885, 10.97)
             cv2.line(img, nl, nr, (200, 200, 200), 2)
 
-        else:  # pickleball
-            # Outer rectangle
+        else:  # pickleball (20ft x 44ft = 6.10m x 13.41m)
+            thickness = 2
+
+            # Fill entire court blue
             tl = self._court_to_pixel(0, 0)
             br = self._court_to_pixel(13.41, 6.10)
+            cv2.rectangle(img, tl, br, (170, 100, 30), -1)  # Blue court
+
+            # Fill kitchen zones lighter blue (NVZ)
+            # Near kitchen: 0 to 2.13m
+            k1_tl = self._court_to_pixel(0, 0)
+            k1_br = self._court_to_pixel(2.13, 6.10)
+            cv2.rectangle(img, k1_tl, k1_br, (190, 130, 60), -1)
+            # Far kitchen: 11.28 to 13.41m
+            k2_tl = self._court_to_pixel(11.28, 0)
+            k2_br = self._court_to_pixel(13.41, 6.10)
+            cv2.rectangle(img, k2_tl, k2_br, (190, 130, 60), -1)
+
+            # Court boundary
             cv2.rectangle(img, tl, br, color, thickness)
 
-            # Kitchen lines (non-volley zone)
+            # Kitchen lines (non-volley zone = 7ft = 2.13m from each baseline)
             kl1 = self._court_to_pixel(2.13, 0)
             kr1 = self._court_to_pixel(2.13, 6.10)
             cv2.line(img, kl1, kr1, color, thickness)
@@ -374,15 +390,20 @@ class MiniMap:
             kr2 = self._court_to_pixel(11.28, 6.10)
             cv2.line(img, kl2, kr2, color, thickness)
 
-            # Center line
-            ct = self._court_to_pixel(2.13, 3.05)
-            cb = self._court_to_pixel(11.28, 3.05)
-            cv2.line(img, ct, cb, color, thickness)
+            # Center line (only in service areas, NOT through kitchen)
+            # Near service area center line
+            ct1 = self._court_to_pixel(2.13, 3.05)
+            cb1 = self._court_to_pixel(6.705, 3.05)
+            cv2.line(img, ct1, cb1, color, thickness)
+            # Far service area center line
+            ct2 = self._court_to_pixel(6.705, 3.05)
+            cb2 = self._court_to_pixel(11.28, 3.05)
+            cv2.line(img, ct2, cb2, color, thickness)
 
-            # Net
+            # Net (at center = 6.705m)
             nl = self._court_to_pixel(6.705, 0)
             nr = self._court_to_pixel(6.705, 6.10)
-            cv2.line(img, nl, nr, (200, 200, 200), 2)
+            cv2.line(img, nl, nr, (200, 200, 200), 3)
 
         return img
 
@@ -617,15 +638,23 @@ class CompositeFrameBuilder:
         panel = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
         panel[:] = (30, 30, 30)  # Dark gray
 
-        # Add mini-map to panel
+        # Add mini-map to panel (preserve aspect ratio)
         if minimap is not None:
-            mm = cv2.resize(minimap, (self.minimap_w, self.minimap_h))
+            mm_h, mm_w = minimap.shape[:2]
+            # Scale to fit panel width while preserving aspect ratio
+            scale = self.minimap_w / mm_w
+            new_w = self.minimap_w
+            new_h = min(int(mm_h * scale), panel_h - 80)  # Leave room for info
+            mm = cv2.resize(minimap, (new_w, new_h))
             y_start = 10
-            panel[y_start : y_start + self.minimap_h, 10 : 10 + self.minimap_w] = mm
+            panel[y_start : y_start + new_h, 10 : 10 + new_w] = mm
+            mm_display_h = new_h
+        else:
+            mm_display_h = 0
 
-        # Add info text
+        # Add info text below minimap
         if info:
-            y = self.minimap_h + 30
+            y = mm_display_h + 30
             font = cv2.FONT_HERSHEY_SIMPLEX
             for key, value in info.items():
                 text = f"{key}: {value}"
