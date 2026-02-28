@@ -362,47 +362,59 @@ class MiniMap:
 
         else:  # pickleball (20ft x 44ft = 6.10m x 13.41m)
             thickness = 2
+            # Key positions (meters):
+            #   Net = 6.705m (center)
+            #   Kitchen line = 7ft (2.13m) from net
+            #     Near kitchen line = 6.705 - 2.13 = 4.575m
+            #     Far kitchen line  = 6.705 + 2.13 = 8.835m
+            #   Service area = baseline to kitchen line (15ft = 4.575m deep)
+            kitchen_near = 4.575   # 15ft from near baseline
+            kitchen_far  = 8.835   # 29ft from near baseline
+            net_pos      = 6.705   # 22ft center
+            court_w      = 6.10
+            court_l      = 13.41
+            half_w       = 3.05    # center of width
 
             # Fill entire court blue
             tl = self._court_to_pixel(0, 0)
-            br = self._court_to_pixel(13.41, 6.10)
-            cv2.rectangle(img, tl, br, (170, 100, 30), -1)  # Blue court
+            br = self._court_to_pixel(court_l, court_w)
+            cv2.rectangle(img, tl, br, (170, 100, 30), -1)
 
-            # Fill kitchen zones lighter blue (NVZ)
-            # Near kitchen: 0 to 2.13m
-            k1_tl = self._court_to_pixel(0, 0)
-            k1_br = self._court_to_pixel(2.13, 6.10)
+            # Fill kitchen zones lighter blue (NVZ = 7ft from net)
+            k1_tl = self._court_to_pixel(kitchen_near, 0)
+            k1_br = self._court_to_pixel(net_pos, court_w)
             cv2.rectangle(img, k1_tl, k1_br, (190, 130, 60), -1)
-            # Far kitchen: 11.28 to 13.41m
-            k2_tl = self._court_to_pixel(11.28, 0)
-            k2_br = self._court_to_pixel(13.41, 6.10)
+            k2_tl = self._court_to_pixel(net_pos, 0)
+            k2_br = self._court_to_pixel(kitchen_far, court_w)
             cv2.rectangle(img, k2_tl, k2_br, (190, 130, 60), -1)
 
             # Court boundary
             cv2.rectangle(img, tl, br, color, thickness)
 
-            # Kitchen lines (non-volley zone = 7ft = 2.13m from each baseline)
-            kl1 = self._court_to_pixel(2.13, 0)
-            kr1 = self._court_to_pixel(2.13, 6.10)
+            # Kitchen lines (7ft from net)
+            kl1 = self._court_to_pixel(kitchen_near, 0)
+            kr1 = self._court_to_pixel(kitchen_near, court_w)
             cv2.line(img, kl1, kr1, color, thickness)
 
-            kl2 = self._court_to_pixel(11.28, 0)
-            kr2 = self._court_to_pixel(11.28, 6.10)
+            kl2 = self._court_to_pixel(kitchen_far, 0)
+            kr2 = self._court_to_pixel(kitchen_far, court_w)
             cv2.line(img, kl2, kr2, color, thickness)
 
-            # Center line (only in service areas, NOT through kitchen)
-            # Near service area center line
-            ct1 = self._court_to_pixel(2.13, 3.05)
-            cb1 = self._court_to_pixel(6.705, 3.05)
-            cv2.line(img, ct1, cb1, color, thickness)
-            # Far service area center line
-            ct2 = self._court_to_pixel(6.705, 3.05)
-            cb2 = self._court_to_pixel(11.28, 3.05)
-            cv2.line(img, ct2, cb2, color, thickness)
+            # Center line ONLY in service areas (baseline to kitchen line)
+            # Near service area
+            cv2.line(img,
+                     self._court_to_pixel(0, half_w),
+                     self._court_to_pixel(kitchen_near, half_w),
+                     color, thickness)
+            # Far service area
+            cv2.line(img,
+                     self._court_to_pixel(kitchen_far, half_w),
+                     self._court_to_pixel(court_l, half_w),
+                     color, thickness)
 
             # Net (at center = 6.705m)
-            nl = self._court_to_pixel(6.705, 0)
-            nr = self._court_to_pixel(6.705, 6.10)
+            nl = self._court_to_pixel(net_pos, 0)
+            nr = self._court_to_pixel(net_pos, court_w)
             cv2.line(img, nl, nr, (200, 200, 200), 3)
 
         return img
