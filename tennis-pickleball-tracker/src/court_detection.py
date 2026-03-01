@@ -98,13 +98,56 @@ PICKLEBALL_COURT_KEYPOINTS = np.array([
     [13.41, 6.10],     # Bottom-right
 ], dtype=np.float32)
 
-# Simplified 4-corner keypoints for pickleball homography
-PICKLEBALL_COURT_CORNERS = np.array([
-    [0.0, 0.0],        # Top-left
-    [0.0, 6.10],       # Top-right
-    [13.41, 0.0],      # Bottom-left
-    [13.41, 6.10],     # Bottom-right
+# 12-keypoint real-world coordinates (meters) for precise homography.
+# Order matches detect_court_lines_hybrid keypoint generation:
+#   0-3: baseline × sideline (4 corners)
+#   4-7: kitchen × sideline (far_left, far_right, near_left, near_right)
+#   8-9: baseline × center (far, near)
+#   10-11: kitchen × center (far, near)
+# Pickleball: 13.41m × 6.10m, kitchen at 2.13m from net, net at 6.705m
+PICKLEBALL_KEYPOINTS_12 = np.array([
+    [0.0,    0.0],    # KP0: far baseline × left sideline
+    [0.0,    6.10],   # KP1: far baseline × right sideline
+    [13.41,  0.0],    # KP2: near baseline × left sideline
+    [13.41,  6.10],   # KP3: near baseline × right sideline
+    [4.575,  0.0],    # KP4: far kitchen × left sideline
+    [4.575,  6.10],   # KP5: far kitchen × right sideline
+    [8.835,  0.0],    # KP6: near kitchen × left sideline
+    [8.835,  6.10],   # KP7: near kitchen × right sideline
+    [0.0,    3.05],   # KP8: far baseline × center
+    [13.41,  3.05],   # KP9: near baseline × center
+    [4.575,  3.05],   # KP10: far kitchen × center
+    [8.835,  3.05],   # KP11: near kitchen × center
 ], dtype=np.float32)
+
+# Backward-compatible 4-corner subset (used by SegmentationCourtDetector)
+PICKLEBALL_COURT_CORNERS = PICKLEBALL_KEYPOINTS_12[:4].copy()
+
+
+def compute_homography_from_keypoints(image_kps, world_kps=None):
+    """Compute homography from detected keypoints to world coordinates.
+    
+    Uses all available matching pairs (≥4 needed) for robust estimation.
+    
+    Args:
+        image_kps: list of (x, y) tuples — detected keypoints in image
+        world_kps: array of world coordinates (default: PICKLEBALL_KEYPOINTS_12)
+    
+    Returns:
+        Homography matrix or None
+    """
+    if world_kps is None:
+        world_kps = PICKLEBALL_KEYPOINTS_12
+    
+    n = min(len(image_kps), len(world_kps))
+    if n < 4:
+        return None
+    
+    src = np.array(image_kps[:n], dtype=np.float32)
+    dst = world_kps[:n].astype(np.float32)
+    
+    H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+    return H
 
 
 def load_court_config(config_path: str = "configs/court_config.yaml") -> dict:
@@ -803,15 +846,16 @@ def detect_court_lines_hybrid(
 ) -> Dict:
     """
     Detect precise court lines using hybrid approach:
-    segmentation mask + classical CV (white line filtering + Hough).
+    segmentation mask + classical CV (white line filtering + Hough)
+    + dense contour keypoints + near baseline recovery.
 
     Args:
         frame: BGR frame
         court_mask: binary mask (0/1 uint8) of court region from seg model
 
     Returns:
-        Dict with 'lines' (all detected), 'baselines', 'sidelines',
-        'kitchen_lines', 'keypoints', 'corners'
+        Dict with 'lines', 'baselines', 'sidelines', 'kitchen_lines',
+        'keypoints', 'corners', 'dense_keypoints', 'contour_lines'
     """
     h, w = frame.shape[:2]
     result = {
@@ -821,6 +865,10 @@ def detect_court_lines_hybrid(
         "kitchen_lines": [],
         "keypoints": [],
         "corners": None,
+        "dense_keypoints": [],
+        "contour_lines": [],
+        "center_line": None,
+        "net_line": None,
     }
 
     # Step 1: White line detection within court mask
@@ -851,62 +899,94 @@ def detect_court_lines_hybrid(
     white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
     white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel)
 
-    # Step 2: Edge + Hough
+    # Step 2: White detection on FULL court mask (for near baseline recovery)
+    white_hsv_full = cv2.inRange(hsv, (0, 0, 140), (180, 90, 255))
+    L_full = cv2.bitwise_and(L, L, mask=court_mask)
+    cp_full = L_full[court_mask > 0]
+    p88 = np.percentile(cp_full, 88) if len(cp_full) > 0 else 180
+    white_lab_full = (L_full > p88).astype(np.uint8) * 255
+    white_mask_full = cv2.bitwise_or(white_lab_full, white_hsv_full)
+    white_mask_full = cv2.bitwise_and(white_mask_full, white_mask_full, mask=court_mask)
+    white_mask_full = cv2.morphologyEx(white_mask_full, cv2.MORPH_OPEN, kernel)
+    white_mask_full = cv2.morphologyEx(white_mask_full, cv2.MORPH_CLOSE, kernel)
+
+    # Step 3: Dense contour keypoints from white regions
+    contours, _ = cv2.findContours(
+        white_mask_full, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    dense_kps = []
+    contour_lines_data = []
+    for cnt in contours:
+        perimeter = cv2.arcLength(cnt, closed=False)
+        if perimeter < 60 or len(cnt) < 5:
+            continue
+        rect = cv2.minAreaRect(cnt)
+        (cx, cy), (rw, rh), angle = rect
+        aspect = max(rw, rh) / (min(rw, rh) + 1e-6)
+        if aspect < 3:
+            continue  # Not line-like, skip blobs
+        if rw < rh:
+            line_angle = 90 + angle
+        else:
+            line_angle = angle
+        line_angle = abs(line_angle) % 180
+        if line_angle < 25 or line_angle > 155:
+            cls = "horizontal"
+        elif 25 <= line_angle <= 75 or 105 <= line_angle <= 155:
+            cls = "diagonal"
+        else:
+            cls = "vertical"
+        contour_lines_data.append({
+            "class": cls, "center": (int(cx), int(cy)),
+            "angle": line_angle, "perimeter": perimeter,
+        })
+        n_samples = max(int(perimeter / 25), 3)
+        for i in range(n_samples):
+            idx = int(i * len(cnt) / n_samples) % len(cnt)
+            dense_kps.append(tuple(cnt[idx][0]))
+    result["dense_keypoints"] = dense_kps
+    result["contour_lines"] = contour_lines_data
+
+    # Step 4: Hough lines + validation
     edges = cv2.Canny(white_mask, 50, 150, apertureSize=3)
     lines_p = cv2.HoughLinesP(
         edges, rho=1, theta=np.pi / 180, threshold=50,
         minLineLength=80, maxLineGap=30,
     )
-    if lines_p is None or len(lines_p) == 0:
-        return result
 
-    # Step 2.5: Validate lines — only keep lines where pixels are on white
     def validate_line_on_white(x1, y1, x2, y2, white_img, min_ratio=0.4):
-        """Check that ≥40% of pixels along line lie on white mask."""
         n_samples = max(int(np.sqrt((x2-x1)**2 + (y2-y1)**2) / 3), 5)
-        xs = np.linspace(x1, x2, n_samples).astype(int)
-        ys = np.linspace(y1, y2, n_samples).astype(int)
-        # Clip to image bounds
-        xs = np.clip(xs, 0, white_img.shape[1] - 1)
-        ys = np.clip(ys, 0, white_img.shape[0] - 1)
-        on_white = sum(1 for x, y in zip(xs, ys) if white_img[y, x] > 0)
-        return on_white / n_samples >= min_ratio
+        xs = np.clip(np.linspace(x1, x2, n_samples).astype(int), 0, white_img.shape[1]-1)
+        ys = np.clip(np.linspace(y1, y2, n_samples).astype(int), 0, white_img.shape[0]-1)
+        return sum(1 for x, y in zip(xs, ys) if white_img[y, x] > 0) / n_samples >= min_ratio
 
     valid_lines = []
-    for line in lines_p:
-        x1, y1, x2, y2 = line[0]
-        if validate_line_on_white(x1, y1, x2, y2, white_mask):
-            valid_lines.append(line)
-    if not valid_lines:
-        return result
-    lines_p = np.array(valid_lines)
+    if lines_p is not None:
+        for line in lines_p:
+            x1, y1, x2, y2 = line[0]
+            if validate_line_on_white(x1, y1, x2, y2, white_mask):
+                valid_lines.append(line)
 
-    # Step 3: Classify lines by angle
-    # In broadcast perspective: baselines are near-horizontal,
-    # sidelines are diagonal (converging to vanishing point)
+    # Step 5: Classify & cluster Hough lines
     all_lines = []
-    for line in lines_p:
-        x1, y1, x2, y2 = line[0]
-        dx = x2 - x1
-        dy = y2 - y1
-        angle = np.degrees(np.arctan2(abs(dy), abs(dx)))
-        length = np.sqrt(dx ** 2 + dy ** 2)
-        mid_x = (x1 + x2) / 2
-        mid_y = (y1 + y2) / 2
-        all_lines.append({
-            "pts": (x1, y1, x2, y2),
-            "angle": angle,
-            "length": length,
-            "mid": (mid_x, mid_y),
-            "slope": dy / (dx + 1e-6),
-        })
+    if valid_lines:
+        for line in valid_lines:
+            x1, y1, x2, y2 = line[0]
+            dx, dy = x2 - x1, y2 - y1
+            angle = np.degrees(np.arctan2(abs(dy), abs(dx)))
+            length = np.sqrt(dx**2 + dy**2)
+            all_lines.append({
+                "pts": (x1, y1, x2, y2), "angle": angle,
+                "length": length, "mid": ((x1+x2)/2, (y1+y2)/2),
+                "slope": dy / (dx + 1e-6),
+            })
     result["lines"] = all_lines
 
-    # Classify: horizontal-ish (<20deg) vs diagonal/vertical
     horiz = [l for l in all_lines if l["angle"] < 20]
-    diag = [l for l in all_lines if l["angle"] >= 20]
+    sideline_cands = [l for l in all_lines if 25 <= l["angle"] <= 75]
+    vertical_cands = [l for l in all_lines if l["angle"] > 75]  # Center line candidates
 
-    # Step 4: Cluster horizontal lines by y-midpoint
+    # Step 4: Cluster lines
     def cluster_lines(lines_list, key_fn, threshold=25):
         if not lines_list:
             return []
@@ -921,72 +1001,277 @@ def detect_court_lines_hybrid(
         return [max(g, key=lambda x: x["length"]) for g in groups]
 
     h_clusters = cluster_lines(horiz, lambda l: l["mid"][1], threshold=25)
-    d_clusters = cluster_lines(diag, lambda l: l["mid"][0], threshold=40)
 
-    # Step 5: Select court lines
-    # Baselines: top-most and bottom-most horizontal clusters
+    # Step 5a: Classify horizontal lines with brightness validation
+    # Strategy:
+    # 1) Baselines = outermost lines → replaced by mask edges in step 6
+    # 2) Net detected directly from white pixel row scan (not Hough)
+    # 3) Kitchen = validated white court lines, NOT shadows or net fragments
+    # 4) If far kitchen not detectable (perspective compression), infer from geometry
+    net_line = None
+    net_y = None
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # Detect net position by scanning white pixel rows in upper court
+    # The net cable creates a narrow high-density white peak
+    court_rows = np.where(np.sum(court_mask, axis=1) > 0)[0]
+    if len(court_rows) > 0:
+        court_top = court_rows[0]
+        court_bot = court_rows[-1]
+        search_end = int(court_top + (court_bot - court_top) * 0.15)
+        best_net_y = None
+        best_net_count = 0
+        for scan_y in range(court_top + 5, search_end):
+            row = white_mask_full[scan_y, :]
+            n_white = int(np.sum(row > 0))
+            if n_white > 200 and n_white > best_net_count:
+                best_net_count = n_white
+                best_net_y = scan_y
+        if best_net_y is not None:
+            cols = np.where(white_mask_full[best_net_y, :] > 0)[0]
+            if len(cols) > 20:
+                net_line = {"pts": (int(cols[0]), best_net_y, int(cols[-1]), best_net_y),
+                            "angle": 0.0, "length": float(cols[-1] - cols[0]),
+                            "mid": (float(np.mean(cols)), float(best_net_y)), "slope": 0.0}
+                net_y = best_net_y
+
     if len(h_clusters) >= 2:
         h_sorted = sorted(h_clusters, key=lambda l: l["mid"][1])
-        result["baselines"] = [h_sorted[0], h_sorted[-1]]  # far baseline, near baseline
-        # Kitchen lines: horizontal lines between baselines
+        result["baselines"] = [h_sorted[0], h_sorted[-1]]
+
         if len(h_sorted) > 2:
-            result["kitchen_lines"] = h_sorted[1:-1]
+            middle_lines = h_sorted[1:-1]
+
+            # Kitchen lines: validate brightness + not near net
+            kitchen_candidates = []
+            for line in middle_lines:
+                ly = int(line["mid"][1])
+                # Skip if too close to net (within 60px = net artifact/shadow)
+                if net_y is not None and abs(ly - net_y) < 60:
+                    continue
+                # Brightness check: average gray in center strip
+                if 0 < ly < h:
+                    cx_start = w // 4
+                    cx_end = 3 * w // 4
+                    strip = gray[ly, cx_start:cx_end]
+                    avg_brightness = np.mean(strip)
+                    # Court lines are white (brightness > 130)
+                    if avg_brightness > 130:
+                        kitchen_candidates.append(line)
+
+            # Assign validated kitchen lines
+            if len(kitchen_candidates) >= 2:
+                kitchen_candidates.sort(key=lambda l: l["mid"][1])
+                result["kitchen_lines"] = kitchen_candidates[:2]
+            elif len(kitchen_candidates) == 1:
+                result["kitchen_lines"] = kitchen_candidates
     elif len(h_clusters) == 1:
         result["baselines"] = h_clusters
+    result["net_line"] = net_line
 
-    # Sidelines: left-most and right-most diagonal clusters
-    if len(d_clusters) >= 2:
-        d_sorted = sorted(d_clusters, key=lambda l: l["mid"][0])
-        result["sidelines"] = [d_sorted[0], d_sorted[-1]]  # left, right
+    # Step 5b: Detect center line (vertical, near court center x)
+    center_line = None
+    if vertical_cands:
+        # Center line should be near the horizontal center of the court
+        court_cols = np.where(np.sum(court_mask, axis=0) > 0)[0]
+        if len(court_cols) > 0:
+            court_center_x = (court_cols[0] + court_cols[-1]) / 2
+            # Find longest vertical line near center
+            center_cands = [l for l in vertical_cands
+                           if abs(l["mid"][0] - court_center_x) < (court_cols[-1] - court_cols[0]) * 0.15]
+            if center_cands:
+                center_line = max(center_cands, key=lambda l: l["length"])
+    result["center_line"] = center_line
 
-    # Step 6: Compute keypoints (intersections of baselines x sidelines)
+    # Sidelines by slope direction (trapezoid: top < bottom)
+    left_c, right_c = [], []
+    for l in sideline_cands:
+        x1, y1, x2, y2 = l["pts"]
+        if y1 > y2: x1, y1, x2, y2 = x2, y2, x1, y1
+        dx = x2 - x1
+        if dx < -10: left_c.append(l)
+        elif dx > 10: right_c.append(l)
+    left_sl = max(left_c, key=lambda l: l["length"]) if left_c else None
+    right_sl = max(right_c, key=lambda l: l["length"]) if right_c else None
+    result["sidelines"] = [s for s in [left_sl, right_sl] if s]
+
+    # Step 6a: Near baseline recovery — ALWAYS check for lower white lines
+    if court_mask is not None:
+        bot = white_mask_full[int(h*0.5):, :]
+        row_counts = np.sum(bot > 0, axis=1)
+        sig = np.where(row_counts > w * 0.05)[0]
+        if len(sig) > 0:
+            near_y = sig[-1] + int(h*0.5)
+            cols = np.where(white_mask_full[near_y, :] > 0)[0]
+            if len(cols) > 20:
+                nb = {"pts": (int(cols[0]), near_y, int(cols[-1]), near_y),
+                      "angle": 0.0, "length": float(cols[-1]-cols[0]),
+                      "mid": (float(np.mean(cols)), float(near_y)), "slope": 0.0}
+                cur_near_y = result["baselines"][-1]["mid"][1] if result["baselines"] else 0
+                if near_y > cur_near_y + 30:
+                    if len(result["baselines"]) >= 2:
+                        # Just replace — don't demote to kitchen
+                        result["baselines"][-1] = nb
+                    elif len(result["baselines"]) == 1:
+                        result["baselines"].append(nb)
+                    else:
+                        result["baselines"] = [nb]
+
+    # Step 6b: Far baseline recovery from court mask top edge
+    # The net often gets detected as far baseline — fix by finding
+    # the actual top boundary of the court mask
+    if court_mask is not None:
+        court_rows = np.where(np.sum(court_mask, axis=1) > 10)[0]
+        if len(court_rows) > 0:
+            top_y = court_rows[0]
+            # Scan a few rows near top for white pixels  
+            for scan_y in range(top_y, min(top_y + 30, h)):
+                cols = np.where(white_mask_full[scan_y, :] > 0)[0]
+                if len(cols) > 15:
+                    fb = {"pts": (int(cols[0]), scan_y, int(cols[-1]), scan_y),
+                          "angle": 0.0, "length": float(cols[-1]-cols[0]),
+                          "mid": (float(np.mean(cols)), float(scan_y)), "slope": 0.0}
+                    cur_far_y = result["baselines"][0]["mid"][1] if result["baselines"] else h
+                    if scan_y < cur_far_y - 20:
+                        # Found baseline above current far baseline
+                        if len(result["baselines"]) >= 2:
+                            # Just replace — don't demote to kitchen
+                            result["baselines"][0] = fb
+                        elif len(result["baselines"]) == 1:
+                            result["baselines"].insert(0, fb)
+                        else:
+                            result["baselines"] = [fb]
+                    break
+    if len(result["baselines"]) < 2 and court_mask is not None:
+        top = white_mask_full[:int(h*0.5), :]
+        row_counts = np.sum(top > 0, axis=1)
+        sig = np.where(row_counts > w * 0.03)[0]
+        if len(sig) > 0:
+            far_y = sig[0]
+            cols = np.where(white_mask_full[far_y, :] > 0)[0]
+            if len(cols) > 20:
+                fb = {"pts": (int(cols[0]), far_y, int(cols[-1]), far_y),
+                      "angle": 0.0, "length": float(cols[-1]-cols[0]),
+                      "mid": (float(np.mean(cols)), float(far_y)), "slope": 0.0}
+                if not result["baselines"] or far_y < result["baselines"][0]["mid"][1]:
+                    result["baselines"].insert(0, fb)
+                else:
+                    result["baselines"].append(fb)
+
+
+    # Step 6c: Infer missing kitchen lines from court geometry
+    # Pickleball: kitchen is 7ft from net, court half is 22ft
+    # kitchen_ratio = 7/22 ≈ 0.318 from the net toward each baseline
+    # In perspective, the far half is very compressed — far kitchen often
+    # undetectable. Infer its position from baselines + net.
+    if len(result["kitchen_lines"]) < 2 and len(result["baselines"]) >= 2:
+        far_y = result["baselines"][0]["mid"][1]
+        near_y = result["baselines"][-1]["mid"][1]
+        far_x0 = result["baselines"][0]["pts"][0]
+        far_x1 = result["baselines"][0]["pts"][2]
+        near_x0 = result["baselines"][-1]["pts"][0]
+        near_x1 = result["baselines"][-1]["pts"][2]
+
+        # Estimate net position if not detected
+        if net_y is None:
+            # In perspective, net appears at ~35% from far baseline toward near
+            net_y_est = far_y + (near_y - far_y) * 0.10
+        else:
+            net_y_est = net_y
+
+        kitchen_ratio = 7.0 / 22.0  # 0.318
+
+        existing_ys = set(int(k["mid"][1]) for k in result["kitchen_lines"])
+
+        # Far kitchen: between far baseline and net
+        far_kitchen_y = far_y + (net_y_est - far_y) * (1.0 - kitchen_ratio)
+        # Near kitchen: between net and near baseline
+        near_kitchen_y = net_y_est + (near_y - net_y_est) * kitchen_ratio
+
+        def make_synthetic_line(y_pos):
+            """Create a synthetic horizontal line at y_pos, interpolating x from baselines."""
+            t = (y_pos - far_y) / max(near_y - far_y, 1)
+            x0 = int(far_x0 + (near_x0 - far_x0) * t)
+            x1 = int(far_x1 + (near_x1 - far_x1) * t)
+            return {"pts": (x0, int(y_pos), x1, int(y_pos)),
+                    "angle": 0.0, "length": float(x1 - x0),
+                    "mid": (float((x0 + x1) / 2), float(y_pos)), "slope": 0.0}
+
+        if len(result["kitchen_lines"]) == 0:
+            # Both missing — add both
+            result["kitchen_lines"] = [
+                make_synthetic_line(far_kitchen_y),
+                make_synthetic_line(near_kitchen_y),
+            ]
+        elif len(result["kitchen_lines"]) == 1:
+            k_y = result["kitchen_lines"][0]["mid"][1]
+            # Check if existing kitchen is near-side or far-side
+            if net_y_est is not None and k_y > net_y_est:
+                # Existing is near kitchen → add far kitchen
+                result["kitchen_lines"].insert(0, make_synthetic_line(far_kitchen_y))
+            else:
+                # Existing is far kitchen → add near kitchen
+                result["kitchen_lines"].append(make_synthetic_line(near_kitchen_y))
+    # Step 7: Compute intersection keypoints
     def line_intersection(l1, l2):
-        """Find intersection of two line segments (extended to infinite lines)."""
         x1, y1, x2, y2 = l1["pts"]
         x3, y3, x4, y4 = l2["pts"]
-        denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-        if abs(denom) < 1e-6:
-            return None
-        t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
-        ix = x1 + t * (x2 - x1)
-        iy = y1 + t * (y2 - y1)
-        # Sanity check: intersection should be within frame bounds (with margin)
-        if -100 < ix < w + 100 and -100 < iy < h + 100:
+        denom = (x1-x2)*(y3-y4) - (y1-y2)*(x3-x4)
+        if abs(denom) < 1e-6: return None
+        t = ((x1-x3)*(y3-y4) - (y1-y3)*(x3-x4)) / denom
+        ix = x1 + t*(x2-x1)
+        iy = y1 + t*(y2-y1)
+        if -200 < ix < w+200 and -200 < iy < h+200:
             return (int(ix), int(iy))
         return None
 
     keypoints = []
+    # Baseline × Sideline intersections (4 corners)
     for bl in result["baselines"]:
         for sl in result["sidelines"]:
             pt = line_intersection(bl, sl)
             if pt:
                 keypoints.append(pt)
-    # Also kitchen x sidelines
+    # Kitchen × Sideline intersections
     for kl in result["kitchen_lines"]:
         for sl in result["sidelines"]:
             pt = line_intersection(kl, sl)
             if pt:
                 keypoints.append(pt)
+    # Baseline × Center line (service area dividers)
+    if center_line:
+        for bl in result["baselines"]:
+            pt = line_intersection(bl, center_line)
+            if pt:
+                keypoints.append(pt)
+        # Kitchen × Center line
+        for kl in result["kitchen_lines"]:
+            pt = line_intersection(kl, center_line)
+            if pt:
+                keypoints.append(pt)
     result["keypoints"] = keypoints
 
-    # Step 7: Extract 4 corners from baseline x sideline intersections
+    # Step 8: Extract 4 corners + trapezoid validation
     if len(result["baselines"]) >= 2 and len(result["sidelines"]) >= 2:
+        bl_s = sorted(result["baselines"], key=lambda l: l["mid"][1])
         corners = []
-        for bl in result["baselines"]:
-            for sl in result["sidelines"]:
+        for bl in bl_s:
+            for sl in sorted(result["sidelines"], key=lambda l: l["mid"][0]):
                 pt = line_intersection(bl, sl)
-                if pt:
-                    corners.append(pt)
+                if pt: corners.append(pt)
         if len(corners) >= 4:
             corners = np.array(corners[:4], dtype=np.float32)
-            # Order: TL, TR, BL, BR
             sums = corners[:, 0] + corners[:, 1]
             diffs = corners[:, 1] - corners[:, 0]
             tl = corners[int(np.argmin(sums))]
             br = corners[int(np.argmax(sums))]
             tr = corners[int(np.argmin(diffs))]
             bl_pt = corners[int(np.argmax(diffs))]
-            result["corners"] = np.array([tl, tr, bl_pt, br], dtype=np.float32)
+            ordered = np.array([tl, tr, bl_pt, br], dtype=np.float32)
+            top_w = np.linalg.norm(tr - tl)
+            bot_w = np.linalg.norm(br - bl_pt)
+            if top_w < bot_w:
+                result["corners"] = ordered
 
     return result
 
@@ -1029,22 +1314,47 @@ def draw_court_lines_overlay(
             cv2.line(out, (x1, y1), (x2, y2), (0, 255, 0), 3)
 
     # Draw kitchen lines between their keypoint intersections (yellow)
-    kitchen_kps = court_lines.get("keypoints", [])
-    # Kitchen keypoints come after the 4 corner keypoints
-    if len(kitchen_kps) > 4:
-        # Kitchen points are pairs from kitchen lines x sidelines
-        for i in range(4, len(kitchen_kps) - 1, 2):
-            pt1 = kitchen_kps[i]
-            pt2 = kitchen_kps[i + 1]
-            cv2.line(out, pt1, pt2, (0, 255, 255), 2)
-    elif court_lines.get("kitchen_lines"):
+    all_kps = court_lines.get("keypoints", [])
+    n_baselines = len(court_lines.get("baselines", []))
+    n_sidelines = len(court_lines.get("sidelines", []))
+    n_kitchen = len(court_lines.get("kitchen_lines", []))
+    n_corner_kps = n_baselines * n_sidelines  # Usually 4
+    n_kitchen_sl_kps = n_kitchen * n_sidelines  # Kitchen × sidelines
+
+    # Kitchen × sideline pairs (drawn as yellow lines)
+    kitchen_sl_start = n_corner_kps
+    kitchen_sl_end = kitchen_sl_start + n_kitchen_sl_kps
+    for i in range(kitchen_sl_start, min(kitchen_sl_end, len(all_kps)) - 1, 2):
+        pt1 = all_kps[i]
+        pt2 = all_kps[i + 1]
+        cv2.line(out, pt1, pt2, (0, 255, 255), 2)  # Yellow
+
+    # Fallback: draw kitchen lines from raw Hough data
+    if n_kitchen_sl_kps == 0 and court_lines.get("kitchen_lines"):
         for line in court_lines["kitchen_lines"]:
             x1, y1, x2, y2 = line["pts"]
             cv2.line(out, (x1, y1), (x2, y2), (0, 255, 255), 2)
 
-    # Draw keypoints (circles)
+    # Draw center line (orange) if detected
+    cl = court_lines.get("center_line")
+    if cl:
+        x1, y1, x2, y2 = cl["pts"]
+        cv2.line(out, (x1, y1), (x2, y2), (0, 165, 255), 2)  # Orange
+
+    # Draw net line (white, thicker) if detected
+    nl = court_lines.get("net_line")
+    if nl:
+        x1, y1, x2, y2 = nl["pts"]
+        cv2.line(out, (x1, y1), (x2, y2), (255, 255, 255), 2)  # White
+
+    # Draw dense keypoints along white line contours (cyan, small)
+    for pt in court_lines.get("dense_keypoints", []):
+        cv2.circle(out, pt, 4, (255, 255, 0), -1)  # Cyan filled
+        cv2.circle(out, pt, 5, (255, 255, 255), 1)  # White outline
+
+    # Draw intersection keypoints (red, larger — structural)
     if draw_keypoints:
-        for pt in kitchen_kps:
+        for pt in all_kps:
             cv2.circle(out, pt, 6, (0, 0, 255), -1)  # Red filled
             cv2.circle(out, pt, 7, (255, 255, 255), 2)  # White outline
 
@@ -1063,6 +1373,7 @@ class SegmentationCourtDetector:
         self.model_path = model_path
         self.conf_threshold = conf_threshold
         self._model = None
+        self.last_court_mask = None  # Cache for overlay drawing
 
     def _get_model(self):
         """Lazy-load YOLOv8-seg model."""
@@ -1114,6 +1425,12 @@ class SegmentationCourtDetector:
                     continue
 
                 xy = mask_data.xy[0] if hasattr(mask_data, "xy") and len(mask_data.xy) > 0 else None
+
+                # Cache the binary mask for hybrid line detection
+                h_f, w_f = frame.shape[:2]
+                mask_bin = mask_data.data[0].cpu().numpy()
+                mask_resized = cv2.resize(mask_bin, (w_f, h_f))
+                self.last_court_mask = (mask_resized > 0.5).astype(np.uint8)
                 if xy is None:
                     continue
 
@@ -1446,3 +1763,124 @@ def draw_court_overlay(
         cv2.line(overlay, tuple(pts_int[2]), tuple(pts_int[0]), color, thickness)
 
     return overlay
+
+
+class CourtTracker:
+    """Temporal smoothing for court detection across video frames.
+
+    Provides:
+    - Reference frame lock: first N frames establish stable reference
+    - EMA smoothing: reduces jitter between consecutive frames
+    - Outlier rejection: keypoints that jump too far are replaced
+    - Confidence fallback: reuse last good detection on bad frames
+    """
+
+    def __init__(self, alpha: float = 0.3, outlier_px: float = 50.0,
+                 ref_frames: int = 10):
+        self.alpha = alpha              # EMA smoothing factor (0=all prev, 1=all new)
+        self.outlier_px = outlier_px    # Max allowed keypoint movement from reference
+        self.ref_frames = ref_frames    # Frames to collect before locking reference
+        self.ref_keypoints = None       # Locked reference keypoints (median of first N)
+        self.prev_keypoints = None      # Previous frame's smoothed keypoints
+        self.prev_court_lines = None    # Previous frame's full court_lines dict
+        self.history = []               # Keypoint buffer for reference computation
+        self.frames_since_reference = 0
+        self.rejection_count = 0        # Consecutive frames with high rejection
+
+    def update(self, court_lines: Dict) -> Dict:
+        """Smooth court_lines keypoints using temporal tracking.
+
+        Args:
+            court_lines: result from detect_court_lines_hybrid()
+
+        Returns:
+            Smoothed court_lines dict
+        """
+        kps = court_lines.get("keypoints", [])
+
+        # No keypoints detected — fallback to previous
+        if not kps:
+            if self.prev_court_lines is not None:
+                return self.prev_court_lines
+            return court_lines
+
+        kps_arr = np.array(kps, dtype=np.float64)
+
+        # Phase 1: Collecting reference frames
+        if len(self.history) < self.ref_frames:
+            self.history.append(kps_arr.copy())
+            self.prev_keypoints = kps_arr
+            self.prev_court_lines = court_lines
+            # Lock reference once we have enough frames
+            if len(self.history) == self.ref_frames:
+                self._build_reference()
+            return court_lines
+
+        # Phase 2: Temporal smoothing
+        n_kps = min(len(kps_arr), len(self.prev_keypoints))
+        if n_kps == 0:
+            if self.prev_court_lines is not None:
+                return self.prev_court_lines
+            return court_lines
+
+        smoothed = kps_arr[:n_kps].copy()
+        n_rejected = 0
+
+        for i in range(n_kps):
+            new_pt = kps_arr[i]
+            prev_pt = self.prev_keypoints[i] if i < len(self.prev_keypoints) else new_pt
+
+            # EMA smoothing
+            smoothed_pt = self.alpha * new_pt + (1 - self.alpha) * prev_pt
+
+            # Outlier rejection against reference
+            if self.ref_keypoints is not None and i < len(self.ref_keypoints):
+                ref_pt = self.ref_keypoints[i]
+                dist = np.linalg.norm(smoothed_pt - ref_pt)
+                if dist > self.outlier_px:
+                    # Too far from reference — use reference instead
+                    smoothed_pt = ref_pt
+                    n_rejected += 1
+
+            smoothed[i] = smoothed_pt
+
+        # Convert back to tuple list
+        smoothed_kps = [tuple(pt.astype(int)) for pt in smoothed]
+        court_lines["keypoints"] = smoothed_kps
+        self.prev_keypoints = smoothed.copy()
+
+        # Update corners from smoothed keypoints (first 4 are corners)
+        if len(smoothed_kps) >= 4 and court_lines.get("corners") is not None:
+            court_lines["corners"] = np.array(smoothed_kps[:4], dtype=np.float32)
+
+        # Re-detection trigger: if >70% keypoints rejected, rebuild reference
+        rejection_rate = n_rejected / max(n_kps, 1)
+        if rejection_rate > 0.7:
+            self.rejection_count += 1
+            if self.rejection_count > 15:  # 15 consecutive bad frames
+                self.history = []
+                self.ref_keypoints = None
+                self.rejection_count = 0
+        else:
+            self.rejection_count = 0
+
+        self.prev_court_lines = court_lines
+        self.frames_since_reference += 1
+        return court_lines
+
+    def _build_reference(self):
+        """Compute reference keypoints as median of collected frames."""
+        if not self.history:
+            return
+        # Pad shorter arrays to match the longest
+        max_len = max(len(h) for h in self.history)
+        padded = []
+        for h in self.history:
+            if len(h) < max_len:
+                pad = np.zeros((max_len - len(h), 2))
+                padded.append(np.vstack([h, pad]))
+            else:
+                padded.append(h[:max_len])
+        stacked = np.stack(padded, axis=0)  # (N_frames, N_kps, 2)
+        self.ref_keypoints = np.median(stacked, axis=0)
+        self.prev_keypoints = self.ref_keypoints.copy()

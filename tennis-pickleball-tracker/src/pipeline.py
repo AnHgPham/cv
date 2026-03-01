@@ -31,6 +31,7 @@ try:
         DeepCourtDetector,
         SegmentationCourtDetector,
         SIFTCourtMatcher,
+        CourtTracker,
         transform_point,
         TENNIS_COURT_CORNERS,
         PICKLEBALL_COURT_CORNERS,
@@ -66,6 +67,7 @@ except ImportError:
         DeepCourtDetector,
         SegmentationCourtDetector,
         SIFTCourtMatcher,
+        CourtTracker,
         transform_point,
         TENNIS_COURT_CORNERS,
         PICKLEBALL_COURT_CORNERS,
@@ -736,33 +738,26 @@ class TennisPickleballPipeline:
             )
 
         # Draw court lines overlay (hybrid: seg mask + classical CV)
-        if self.homography is not None and hasattr(self, 'court_detector'):
+        court_mask = getattr(self.court_detector, 'last_court_mask', None) if hasattr(self, 'court_detector') else None
+        if self.homography is not None and court_mask is not None:
             try:
-                from court_detection import detect_court_lines_hybrid, draw_court_lines_overlay
-                # Get court seg mask from detector
-                model = self.court_detector._get_model()
-                preds = model(frame, conf=0.3, verbose=False)
-                court_mask = None
-                for r in preds:
-                    if r.masks is not None and len(r.masks) > 0:
-                        mask_np = r.masks[0].data[0].cpu().numpy()
-                        h_f, w_f = frame.shape[:2]
-                        court_mask = cv2.resize(mask_np, (w_f, h_f))
-                        court_mask = (court_mask > 0.5).astype(np.uint8)
-                        break
-                if court_mask is not None:
-                    court_lines = detect_court_lines_hybrid(frame, court_mask)
-                    annotated = draw_court_lines_overlay(annotated, court_lines)
-                    # Use hybrid corners for more precise homography if available
-                    if court_lines["corners"] is not None:
-                        from court_detection import PICKLEBALL_COURT_CORNERS
-                        H_precise, _ = cv2.findHomography(
-                            court_lines["corners"][:4].astype(np.float32),
-                            PICKLEBALL_COURT_CORNERS[:4].astype(np.float32),
-                            cv2.RANSAC, 5.0,
-                        )
-                        if H_precise is not None:
-                            self.homography = H_precise
+                from court_detection import detect_court_lines_hybrid, draw_court_lines_overlay, CourtTracker
+                court_lines = detect_court_lines_hybrid(frame, court_mask)
+                # Temporal smoothing via CourtTracker
+                if not hasattr(self, '_court_tracker'):
+                    self._court_tracker = CourtTracker(alpha=0.3, outlier_px=50.0, ref_frames=10)
+                court_lines = self._court_tracker.update(court_lines)
+                annotated = draw_court_lines_overlay(annotated, court_lines)
+                # Use hybrid corners for more precise homography if available
+                if court_lines["corners"] is not None:
+                    from court_detection import PICKLEBALL_COURT_CORNERS
+                    H_precise, _ = cv2.findHomography(
+                        court_lines["corners"][:4].astype(np.float32),
+                        PICKLEBALL_COURT_CORNERS[:4].astype(np.float32),
+                        cv2.RANSAC, 5.0,
+                    )
+                    if H_precise is not None:
+                        self.homography = H_precise
             except Exception:
                 pass  # Fall back to no overlay
 
