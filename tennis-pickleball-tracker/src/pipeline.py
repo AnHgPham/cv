@@ -32,6 +32,7 @@ try:
         SegmentationCourtDetector,
         SIFTCourtMatcher,
         CourtTracker,
+        compute_homography_from_keypoints,
         transform_point,
         TENNIS_COURT_CORNERS,
         PICKLEBALL_COURT_CORNERS,
@@ -68,6 +69,7 @@ except ImportError:
         SegmentationCourtDetector,
         SIFTCourtMatcher,
         CourtTracker,
+        compute_homography_from_keypoints,
         transform_point,
         TENNIS_COURT_CORNERS,
         PICKLEBALL_COURT_CORNERS,
@@ -542,11 +544,21 @@ class TennisPickleballPipeline:
 
         # ---- Heatmap accumulation ----
         if self.homography is not None and ball_pos:
+            # Use ball bottom for ground projection (ball is airborne)
+            ball_ground_x = ball_pos[0]
+            ball_ground_y = ball_pos[1] + 10  # Approximate ground contact
             court_pos = transform_point(
-                self.homography, np.array([ball_pos[0], ball_pos[1]])
+                self.homography, np.array([ball_ground_x, ball_ground_y])
             )
-            self.heatmap_gen.add_ball_position(court_pos[0], court_pos[1])
-            result["ball_court_position"] = (court_pos[0], court_pos[1])
+            # EMA smoothing of court position
+            if not hasattr(self, '_prev_ball_court'):
+                self._prev_ball_court = (court_pos[0], court_pos[1])
+            alpha = 0.5
+            cx = alpha * court_pos[0] + (1 - alpha) * self._prev_ball_court[0]
+            cy = alpha * court_pos[1] + (1 - alpha) * self._prev_ball_court[1]
+            self._prev_ball_court = (cx, cy)
+            self.heatmap_gen.add_ball_position(cx, cy)
+            result["ball_court_position"] = (cx, cy)
 
         return result
 
@@ -748,8 +760,14 @@ class TennisPickleballPipeline:
                     self._court_tracker = CourtTracker(alpha=0.3, outlier_px=50.0, ref_frames=10)
                 court_lines = self._court_tracker.update(court_lines)
                 annotated = draw_court_lines_overlay(annotated, court_lines)
-                # Use hybrid corners for more precise homography if available
-                if court_lines["corners"] is not None:
+                # Use 12-keypoint homography for precise mapping
+                if len(court_lines.get("keypoints", [])) >= 4:
+                    H_precise = compute_homography_from_keypoints(
+                        court_lines["keypoints"]
+                    )
+                    if H_precise is not None:
+                        self.homography = H_precise
+                elif court_lines["corners"] is not None:
                     from court_detection import PICKLEBALL_COURT_CORNERS
                     H_precise, _ = cv2.findHomography(
                         court_lines["corners"][:4].astype(np.float32),
