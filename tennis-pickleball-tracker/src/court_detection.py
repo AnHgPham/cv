@@ -744,7 +744,8 @@ def extract_court_corners_from_segmentation(
     Reorders to TL, TR, BL, BR for homography correspondence with
     PICKLEBALL_COURT_CORNERS.
     """
-    if isinstance(mask_or_polygon, np.ndarray) and mask_or_polygon.ndim == 2:
+    if isinstance(mask_or_polygon, np.ndarray) and mask_or_polygon.ndim == 2 and mask_or_polygon.shape[1] != 2:
+        # Binary mask input
         contours, _ = cv2.findContours(
             mask_or_polygon.astype(np.uint8),
             cv2.RETR_EXTERNAL,
@@ -754,26 +755,35 @@ def extract_court_corners_from_segmentation(
             return None
         largest = max(contours, key=cv2.contourArea)
         peri = cv2.arcLength(largest, True)
+        pts = None
         for eps in [0.02, 0.03, 0.05, 0.08]:
             approx = cv2.approxPolyDP(largest, eps * peri, True)
             if len(approx) == 4:
                 pts = approx.reshape(4, 2).astype(np.float32)
                 break
-        else:
+        if pts is None:
             pts = cv2.boxPoints(cv2.minAreaRect(largest)).astype(np.float32)
     else:
-        pts = np.array(mask_or_polygon, dtype=np.float32)
-        if len(pts) > 4:
-            peri = cv2.arcLength(pts.reshape(-1, 1, 2).astype(np.float32), True)
-            for eps in [0.02, 0.03, 0.05]:
-                approx = cv2.approxPolyDP(
-                    pts.reshape(-1, 1, 2).astype(np.float32), eps * peri, True
-                )
+        # Polygon input (list of [x,y] points)
+        poly = np.array(mask_or_polygon, dtype=np.float32)
+        if len(poly) > 4:
+            contour = poly.reshape(-1, 1, 2).astype(np.float32)
+            peri = cv2.arcLength(contour, True)
+            pts = None
+            for eps in [0.02, 0.03, 0.05, 0.08, 0.10]:
+                approx = cv2.approxPolyDP(contour, eps * peri, True)
                 if len(approx) == 4:
                     pts = approx.reshape(4, 2).astype(np.float32)
                     break
+            if pts is None:
+                # Fallback: minimum area rectangle
+                pts = cv2.boxPoints(cv2.minAreaRect(contour)).astype(np.float32)
+        elif len(poly) == 4:
+            pts = poly
+        else:
+            return None
 
-    if len(pts) < 4:
+    if pts is None or len(pts) < 4:
         return None
 
     pts = pts[:4]
@@ -849,7 +859,7 @@ class SegmentationCourtDetector:
                 if cls_name != "Court":
                     continue
 
-                xy = mask_data.xy[j] if hasattr(mask_data, "xy") else None
+                xy = mask_data.xy[0] if hasattr(mask_data, "xy") and len(mask_data.xy) > 0 else None
                 if xy is None:
                     continue
 

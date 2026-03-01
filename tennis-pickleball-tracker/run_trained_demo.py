@@ -6,6 +6,7 @@ os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 
 from pipeline import TennisPickleballPipeline, PipelineConfig
 import cv2
+import numpy as np
 import time
 
 cfg = PipelineConfig()
@@ -15,14 +16,15 @@ cfg.seg_model_path = "models/pickleball_court/best.pt"
 
 # === USE TRAINED BALL MODEL ===
 cfg.yolo_model = "models/ball_detector/best.pt"
-cfg.config["is_custom_yolo"] = True   # Tell YOLODetector this is custom (class 0 = ball)
-cfg.detection_method = "yolo"         # Only YOLO (trained model)
-cfg.yolo_conf = 0.3                   # Confidence threshold
+cfg.config["is_custom_yolo"] = True
+cfg.detection_method = "yolo"
+cfg.yolo_conf = 0.3
 
 print("Initializing pipeline (pickleball + trained ball model)...")
 pipeline = TennisPickleballPipeline(cfg)
 print(f"Court detector: {type(pipeline.court_detector).__name__}")
 print(f"Ball model: {cfg.yolo_model}")
+print(f"Court model: {cfg.seg_model_path}")
 
 INPUT = "data/raw/pickleball_match.mp4"
 OUTPUT = "outputs/pickleball_trained_output.avi"

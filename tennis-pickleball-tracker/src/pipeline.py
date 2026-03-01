@@ -225,9 +225,24 @@ class TennisPickleballPipeline:
         if cfg.detection_method in ("classical", "combined"):
             self.ball_detectors["classical"] = ClassicalBallDetector()
 
-        # Player detection (shares YOLO model instance but filters differently)
-        if cfg.player_method == "yolo" and "yolo" in self.ball_detectors:
-            self.player_detectors["yolo"] = self.ball_detectors["yolo"]
+        # Player detection
+        # When using custom ball model, ball YOLO has no 'person' class
+        # so we need a separate COCO YOLO for players
+        if cfg.player_method == "yolo":
+            if _is_custom and "yolo" in self.ball_detectors:
+                # Ball model is custom → create separate COCO YOLO for players
+                try:
+                    self.player_detectors["yolo"] = YOLODetector(
+                        model_path="yolov8s.pt",
+                        conf_threshold=cfg.yolo_conf,
+                        device=cfg.device,
+                        is_custom_model=False,  # COCO pretrained
+                    )
+                    print("[Pipeline] Using separate COCO YOLO for player detection")
+                except Exception as e:
+                    print(f"WARNING: Could not load player YOLO: {e}")
+            elif "yolo" in self.ball_detectors:
+                self.player_detectors["yolo"] = self.ball_detectors["yolo"]
         elif cfg.player_method == "fasterrcnn":
             try:
                 self.player_detectors["fasterrcnn"] = FasterRCNNDetector(
