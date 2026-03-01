@@ -735,38 +735,36 @@ class TennisPickleballPipeline:
                 annotated, result["player_tracks"]
             )
 
-        # Draw court boundary overlay when detected
-        if self.homography is not None:
+        # Draw court lines overlay (hybrid: seg mask + classical CV)
+        if self.homography is not None and hasattr(self, 'court_detector'):
             try:
-                H_inv = np.linalg.inv(self.homography)
-                # Use pickleball court corners if pickleball mode
-                if self.config.court_type == "pickleball":
-                    court_pts = np.array([
-                        [0, 0], [0, 6.10], [13.41, 0], [13.41, 6.10],
-                        [2.13, 0], [2.13, 6.10],   # Kitchen near
-                        [11.28, 0], [11.28, 6.10],  # Kitchen far
-                        [6.705, 0], [6.705, 6.10],  # Net
-                    ], dtype=np.float32)
-                else:
-                    court_pts = TENNIS_COURT_CORNERS
-
-                from court_detection import transform_points
-                img_pts = transform_points(H_inv, court_pts).astype(int)
-
-                # Draw court outline (green)
-                if len(img_pts) >= 4:
-                    cv2.line(annotated, tuple(img_pts[0]), tuple(img_pts[1]), (0, 255, 0), 2)
-                    cv2.line(annotated, tuple(img_pts[1]), tuple(img_pts[3]), (0, 255, 0), 2)
-                    cv2.line(annotated, tuple(img_pts[3]), tuple(img_pts[2]), (0, 255, 0), 2)
-                    cv2.line(annotated, tuple(img_pts[2]), tuple(img_pts[0]), (0, 255, 0), 2)
-
-                # Draw kitchen lines (yellow) and net (white) for pickleball
-                if self.config.court_type == "pickleball" and len(img_pts) >= 10:
-                    cv2.line(annotated, tuple(img_pts[4]), tuple(img_pts[5]), (0, 255, 255), 2)  # Kitchen near
-                    cv2.line(annotated, tuple(img_pts[6]), tuple(img_pts[7]), (0, 255, 255), 2)  # Kitchen far
-                    cv2.line(annotated, tuple(img_pts[8]), tuple(img_pts[9]), (255, 255, 255), 2)  # Net
+                from court_detection import detect_court_lines_hybrid, draw_court_lines_overlay
+                # Get court seg mask from detector
+                model = self.court_detector._get_model()
+                preds = model(frame, conf=0.3, verbose=False)
+                court_mask = None
+                for r in preds:
+                    if r.masks is not None and len(r.masks) > 0:
+                        mask_np = r.masks[0].data[0].cpu().numpy()
+                        h_f, w_f = frame.shape[:2]
+                        court_mask = cv2.resize(mask_np, (w_f, h_f))
+                        court_mask = (court_mask > 0.5).astype(np.uint8)
+                        break
+                if court_mask is not None:
+                    court_lines = detect_court_lines_hybrid(frame, court_mask)
+                    annotated = draw_court_lines_overlay(annotated, court_lines)
+                    # Use hybrid corners for more precise homography if available
+                    if court_lines["corners"] is not None:
+                        from court_detection import PICKLEBALL_COURT_CORNERS
+                        H_precise, _ = cv2.findHomography(
+                            court_lines["corners"][:4].astype(np.float32),
+                            PICKLEBALL_COURT_CORNERS[:4].astype(np.float32),
+                            cv2.RANSAC, 5.0,
+                        )
+                        if H_precise is not None:
+                            self.homography = H_precise
             except Exception:
-                pass  # Skip overlay if homography inversion fails
+                pass  # Fall back to no overlay
 
         # Draw ball trajectory
         if self.config.show_trajectory and self.ball_pixel_positions:
